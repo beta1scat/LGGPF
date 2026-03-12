@@ -200,7 +200,6 @@ If you use this repository in research, please cite the associated paper.
 @article{niu2025language,
   title={Language-Guided Robot Grasping Based on Basic Geometric Shape Fitting},
   author={Niu, Qun and Zhang, Chuanlin and Zhang, Tianyu and Zhao, Jieliang and Fu, Tie and Chen, Xuemei},
-  author+an = {1:myself="\Author"},
   journal={Advanced Intelligent Systems},
   pages={e202501276},
   year={2025},
