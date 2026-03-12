@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Grasping Interface</title>
+    <style>
+        #container {
+            display: flex;
+            flex-direction: row;
+            gap: 20px;
+        }
+        #image-container, #web-container {
+            width: 48vw;
+            height: 55vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            border: 2px solid #ccc;
+            border-radius: 10px;
+            box-shadow: 0px 4px 8px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+        #output {
+            max-width: 100%;
+            height: auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #result-box {
+            width: 96vw;
+            height: 20vh;
+            overflow-y: scroll;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Robot Grasping Interface</h2>
+    <div id="container">
+        <div id="image-container">
+            <h4>Image Viewer</h4>
+            <div id="output"></div>
+        </div>
+        <div id="web-container">
+            <h4>Environment Viewer</h4>
+            <iframe src="http://127.0.0.1:7000/static/" width="100%" height="100%" frameborder="0"></iframe>
+        </div>
+    </div>
+    <button onclick="loadModels()">Load Models</button>
+    <button onclick="captureImage()">Capture Image</button>
+    <button onclick="getBoxes()">Get Boxes</button>
+    <select onchange="viewBox()" id="box-selector">
+        <option value="" disabled selected>Select box</option>
+    </select>
+    <button onclick="segmentObject()">Segment Object</button>
+    <button onclick="classAndFit()">Classify and Fit Object</button>
+    <button onclick="generatePickPoses()">Generate Pick Poses</button>
+    <select id="pick-pose-selector">
+        <option value="" disabled selected>Select Pick Pose</option>
+    </select>
+    <button onclick="planRobot()">Plan Robot</button>
+    <button onclick="execRobot()">Exec Robot</button>
+    <div id="result-box"></div>
+    <script>
+
+        function postData(url, data = {}) {
+            return fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            }).then(response => response.json());
+        }
+
+        function appendResult(message) {
+            const resultBox = document.getElementById('result-box');
+            const newMessage = document.createElement('div');
+            newMessage.textContent = message;
+            resultBox.appendChild(newMessage);
+            resultBox.scrollTop = resultBox.scrollHeight;
+        }
+
+        function loadModels() {
+            postData('/load_models').then(data => {
+                appendResult(data.message);
+            });
+        }
+
+        function captureImage() {
+            postData('/capture_image').then(data => {
+                if (data.status === 'success') {
+                    const img = document.createElement('img');
+                    img.src = 'data:image/jpeg;base64,' + data.image;
+                    img.style.maxWidth = "100%";
+                    img.style.height = "auto";
+                    document.getElementById('output').innerHTML = '';
+                    document.getElementById('output').appendChild(img);
+                    appendResult("Image captured successfully. " + data.time_str);
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function getBoxes() {
+            const text = prompt("Enter text for object detection:");
+            postData('/get_boxes', { text }).then(data => {
+                if (data.status === 'success') {
+                    appendResult("Bounding boxes: " + JSON.stringify(data.boxes));
+                    const selector = document.getElementById('box-selector');
+                    selector.innerHTML = '<option value="" disabled selected>Select box</option>';
+                    for (let i = 1; i <= data.boxes; i++) {
+                        const option = document.createElement('option');
+                        option.value = i;
+                        option.textContent = `Box ${i}`;
+                        selector.appendChild(option);
+                    }
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function viewBox() {
+            const selectedBox = document.getElementById('box-selector').value;
+            postData('/view_box', { box_index: parseInt(selectedBox) }).then(data => {
+                if (data.status === 'success') {
+                    const img = document.createElement('img');
+                    img.src = 'data:image/jpeg;base64,' + data.image;
+                    img.style.maxWidth = "100%";
+                    img.style.height = "auto";
+                    document.getElementById('output').innerHTML = '';
+                    document.getElementById('output').appendChild(img);
+                    appendResult("Select bounding box: " + JSON.stringify(data.box));
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function segmentObject() {
+            postData('/segment_object').then(data => {
+                if (data.status === 'success') {
+                    appendResult("Segmented object with " + data.point_count + " points.");
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function classAndFit() {
+            postData('/class_and_fit').then(data => {
+                if (data.status === 'success') {
+                    appendResult("Object classified as: " + data.category + ", parameters: " + data.params);
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function generatePickPoses() {
+            postData('/generate_pick_poses').then(data => {
+                if (data.status === 'success') {
+                    appendResult("Generated " + JSON.stringify(data.pick_poses) + " pick poses.");
+                    const selector = document.getElementById('pick-pose-selector');
+                    selector.innerHTML = '<option value="" disabled selected>Select Pick Pose</option>';
+                    for (let i = 1; i <= data.pick_poses; i++) {
+                        const option = document.createElement('option');
+                        option.value = i;
+                        option.textContent = `Pick Pose ${i}`;
+                        selector.appendChild(option);
+                    }
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function planRobot() {
+            const selectedPose = document.getElementById('pick-pose-selector').value;
+            if (!selectedPose) {
+                appendResult("Please select a pick pose before planning.");
+                return;
+            }
+            postData('/plan_robot', { pick_pose_index: parseInt(selectedPose) }).then(data => {
+                if (data.status === 'success') {
+                    appendResult(data.message);
+                } else {
+                    appendResult("Error: " + data.message);
+                }
+            });
+        }
+
+        function execRobot() {
+            postData('/exec_robot').then(data => {
+                appendResult(data.message);
+            });
+        }
+
+    </script>
+</body>
+</html>

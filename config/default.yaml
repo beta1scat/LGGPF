@@ -1,0 +1,108 @@
+# =============================================================================
+# LGGPF Default Configuration
+# Language-Guided Grasping via Primitive Fitting
+# =============================================================================
+
+# --- Camera settings ---
+camera:
+  ip: "192.168.1.200"
+  intrinsics:
+    fx: 2422.56
+    fy: 2422.60
+    cx: 962.29
+    cy: 631.78
+  # Region of interest [x, y, width, height]
+  roi: [230, 210, 1500, 800]
+  # Camera location for orienting surface normals towards the camera
+  normal_orientation_location: [0, 0, 800]
+
+# --- Robot settings ---
+robot:
+  ip: "192.168.1.18"
+  port: 8080
+  connection_level: 3
+  urdf_path: "config/rm65/rm65.urdf"
+  mesh_path: "config/rm65/"
+  # Joint angles in radians for the start (home) position
+  start_pose: [0, 0, 1.5707963267948966, 0, 1.5707963267948966, 0]  # [0, 0, pi/2, 0, pi/2, 0]
+  # Workspace table placement and dimensions (in meters)
+  table:
+    placement: [-0.5, 0.0, -0.51]
+    dimensions: [1, 1, 1]
+
+# --- Calibration matrices ---
+# Hand-eye calibration results (separate calibration)
+# T_ET_Cali: End-effector to tool transform
+# T_BC_Cali: Base to camera transform
+calibration:
+  T_ET:
+    - [-0.99824529,  0.01760311,  0.00375131,  1.38141267]
+    - [-0.01122133, -0.99522476,  0.00885476,  0.66536055]
+    - [ 0.00418488,  0.00666384,  0.99311271, 135.81990251]
+    - [ 0.0,         0.0,         0.0,         1.0]
+  T_BC:
+    - [-0.017163,  -0.998836,   0.045087, -427.415364]
+    - [-0.99985,    0.017242,   0.001369,  -33.403592]
+    - [-0.002145,  -0.045056,  -0.998982,  931.196221]
+    - [ 0.0,        0.0,        0.0,        1.0]
+
+# --- Model paths ---
+models:
+  owlv2: "data/models/owlv2-base-patch16-ensemble"
+  sam: "data/models/sam_vit_h_4b8939.pth"
+  pointnet2: "data/models/best_model_5000.pth"
+
+# --- Gripper settings ---
+gripper:
+  finger_range: 65  # Max opening width in mm
+  # Modbus register addresses and values for gripper control
+  modbus:
+    port: 1
+    device: 1
+    baudrate: 115200
+    timeout: 2
+    force_register: 0x84
+    force_value: 500       # 50% load
+    position_register: 0x80
+    open_value: 2660
+    close_value: 3300
+
+# --- Pipeline parameters ---
+pipeline:
+  # Detection: image resize factor for OWLv2 (0.5 = half resolution)
+  detection_resize_factor: 0.5
+  detection_threshold: 0.1
+  # Segmentation: max points before downsampling
+  segmentation_max_points: 10000
+  # Fitting: max points before downsampling
+  fitting_max_points: 5000
+  # Fitting: synthetic point cloud density for shape comparison
+  fitting_synthetic_points: 5000
+  # Grasp pose generation parameters
+  grasp:
+    z_axis_filter_threshold: 0.7853981633974483  # pi/4
+    gripper_depth_center: 10
+    gripper_depth_side: 20
+    gripper_depth_end: 25
+    cone_num_positions: 20
+    ellipsoid_num_directions: 20
+    approach_offset: 25  # mm, approach distance along tool z-axis
+  # Trajectory planning
+  trajectory:
+    num_path_joints: 100
+    path_time: 3.0  # seconds
+
+  # Language-guided type selection keyword mapping
+  # "cup"/"bowl"/"tube" -> cone types, "ball" -> ellipsoid, else -> cuboid
+  language_type_map:
+    cone_keywords: ["cup", "bowl", "tube"]
+    ellipsoid_keywords: ["ball"]
+    # Grasp strategy keywords
+    center_keywords: ["center"]
+    side_keywords: ["side"]
+
+# --- Logging ---
+logging:
+  save_results: true
+  debug_visualization: true
+  log_directory: "data/logs"
