@@ -48,9 +48,11 @@ lggpf/
 │   ├── grasp/
 │   ├── robot/
 │   └── utils/
-└── web/
-    ├── app.py
-    └── templates/
+├── web/
+│   ├── app.py
+│   └── templates/
+├── visualize_pipeline.py
+└── benchmark_latency.py
 ```
 
 ## Requirements
@@ -161,6 +163,68 @@ pipeline.generate_pick_poses()
 
 if pipeline.plan_trajectory(1):
     pipeline.execute()
+```
+
+## Dissertation & Research Tools
+
+The repository includes two dedicated CLI suites designed for doctoral dissertation evaluation, statistical benchmarking, and publication-quality figure generation.
+
+### 1. Publication Pipeline Visualizer (`visualize_pipeline.py`)
+
+Generates end-to-end composite 6-stage visualization figures for academic publications and thesis defense (corresponding to Figures 5.14, 5.15, and 5.16 in Chapter 5 of the doctoral thesis).
+
+Each generated figure contains 6 synchronized subplots:
+- **(a) OWLv2 目标检测定位 (Open-Vocabulary Detection)**: High-resolution bounding box with cross-modal alignment score.
+- **(b) SAM 提示式实例分割 (Prompted Instance Segmentation)**: Color-coded mask overlay with pixel count statistics.
+- **(c) 点云逆投影与表面法向场 (Point Cloud & Surface Normals)**: Perspective depth unprojection with camera-oriented normal vectors.
+- **(d) 基元拟合 (Primitive Fitting)**: 3D wireframe manifold for cuboids, truncated cones, or ellipsoids.
+- **(e) 候选抓取位姿与夹爪 (Candidate Grasp Poses & Gripper)**: Discrete candidate grasp poses with 3D physical two-finger gripper model.
+- **(f) 五次多项式 $C^2$ 平滑轨迹 (Quintic Trajectory Planning)**: 3D spatial approach, descent, and lift trajectories with workpiece point cloud and compact legend.
+
+**Usage Examples**:
+```bash
+# Render single-object baseline (paper cup)
+python visualize_pipeline.py --session data/success/single/16-23-49 --save-dir ../../figures/chapter5 --name 5_pipeline_single.png
+
+# Render spatial part-constrained grasp (hand cream tube end)
+python visualize_pipeline.py --session data/success/position/17-28-15 --save-dir ../../figures/chapter5 --name 5_pipeline_position.png
+
+# Render cluttered multi-object grasp (cup among obstacles)
+python visualize_pipeline.py --session data/success/multi/22-25-56 --save-dir ../../figures/chapter5 --name 5_pipeline_multi.png
+
+# Optional flags:
+#   --mode auto|full|geometry   Execution mode (default: auto)
+#   --show-joint-inset          Render 2D joint-space trajectory profile in Subplot (f)
+#   --dpi 300                   Output resolution (default: 300)
+```
+
+### 2. Modular Latency Benchmark Suite (`benchmark_latency.py`)
+
+A precision timing evaluation suite for measuring wall-clock latency across all modular pipeline stages (generating Table 5.4 in Chapter 5 of the doctoral dissertation).
+
+**Key Features**:
+- **Precise Timing**: Isolates execution time for each stage:
+  1. OWLv2 detection latency
+  2. SAM segmentation latency
+  3. Depth back-projection & normal estimation latency
+  4. Multi-primitive competitive RANSAC fitting latency
+  5. Grasp manifold generation & feasibility filtering latency
+  6. Quintic polynomial trajectory planning latency
+  7. End-to-end total pipeline latency
+- **CUDA Synchronization**: Uses `torch.cuda.synchronize()` to eliminate asynchronous GPU timing artifacts.
+- **Statistical Aggregation**: Computes mean, standard deviation, median, min, max, and percentage breakdowns across session subsets (`single`, `multi`, `position`).
+- **Thesis-Ready Export**: Automatically formats results into a terminal table, JSON log, and LaTeX table snippet ready for inclusion in the thesis.
+
+**Usage Examples**:
+```bash
+# Run full benchmark on single-object recordings
+python benchmark_latency.py --mode auto --subsets single
+
+# Benchmark all subsets (single, multi, position)
+python benchmark_latency.py --mode auto --subsets single multi position
+
+# Benchmark in offline geometry mode (without heavy neural models)
+python benchmark_latency.py --mode geometry --all
 ```
 
 ## Platform Notes

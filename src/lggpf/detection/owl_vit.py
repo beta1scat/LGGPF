@@ -17,9 +17,15 @@ class VisionLanguageOwlVit:
         path: Local path or HuggingFace model ID for the OWLv2 model.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, device: str | None = None):
         self.processor = Owlv2Processor.from_pretrained(path)
         self.model = Owlv2ForObjectDetection.from_pretrained(path)
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        self.model = self.model.to(self.device)
+        self.model.eval()
 
     def get_boxes_by_text(self, image, text: str, threshold: float = 0.1):
         """Detect objects matching a text description.
@@ -34,17 +40,18 @@ class VisionLanguageOwlVit:
             in xyxy format and scores is a tensor of shape (N,).
         """
         inputs = self.processor(text=[[text]], images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model(**inputs)
 
         if isinstance(image, np.ndarray):
-            target_sizes = torch.Tensor([image.shape[:2]])
+            target_sizes = torch.Tensor([image.shape[:2]]).to(self.device)
         else:
-            target_sizes = torch.Tensor([image.size[::-1]])
+            target_sizes = torch.Tensor([image.size[::-1]]).to(self.device)
 
         results = self.processor.post_process_grounded_object_detection(
             outputs=outputs, target_sizes=target_sizes, threshold=threshold
         )
-        boxes = results[0]["boxes"]
-        scores = results[0]["scores"]
+        boxes = results[0]["boxes"].to("cpu")
+        scores = results[0]["scores"].to("cpu")
         return boxes, scores

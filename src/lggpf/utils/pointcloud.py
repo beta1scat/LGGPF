@@ -127,170 +127,155 @@ def ransac(data, model, n, k, t, d, inliers_ratio=0.5, debug=False, return_all=F
 # =============================================================================
 
 
+def fit_circle_kasa(points):
+    """Direct closed-form algebraic circle fitting in 2D (Kåsa method).
+
+    Solves (x - xc)^2 + (y - yc)^2 = r^2 via linear least squares:
+      2*xc*x + 2*yc*y + (r^2 - xc^2 - yc^2) = x^2 + y^2
+
+    Args:
+        points: (N, 2) array of 2D points.
+
+    Returns:
+        Tuple of (center, radius) where center is (2,) np.ndarray, or None.
+    """
+    pts = np.asarray(points)
+    if len(pts) < 4:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    A = np.column_stack([x, y, np.ones_like(x)])
+    b = x**2 + y**2
+    try:
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        xc = float(sol[0] / 2.0)
+        yc = float(sol[1] / 2.0)
+        rad_sq = float(sol[2] + xc**2 + yc**2)
+        if rad_sq <= 0 or np.isnan(rad_sq):
+            return None
+        r = float(np.sqrt(rad_sq))
+        if np.isnan(r) or np.isinf(r) or r <= 0:
+            return None
+        return np.array([xc, yc]), r
+    except Exception:
+        return None
+
+
 class CircleLeastSquaresModel:
     """2D circle fitting model. Data shape: (N, 2)."""
 
     def fit(self, data):
-        x = data[:, 0]
-        y = data[:, 1]
-        size = data.shape[0]
-        diff_x = 2 * (x[:, np.newaxis] - x[np.newaxis, :])[np.triu_indices(size, k=1)]
-        diff_y = 2 * (y[:, np.newaxis] - y[np.newaxis, :])[np.triu_indices(size, k=1)]
-        xy_2 = x**2 + y**2
-        B = (xy_2[:, np.newaxis] - xy_2[np.newaxis, :])[np.triu_indices(size, k=1)]
-        A = np.hstack((diff_x[:, np.newaxis], diff_y[:, np.newaxis]))
-        center = np.linalg.lstsq(A, B, rcond=None)[0]
-        r = np.mean(
-            np.linalg.norm(
-                np.hstack((x[:, np.newaxis], y[:, np.newaxis])) - center, axis=1
-            )
-        )
-        return (*center, r)
+        kasa_res = fit_circle_kasa(data)
+        if kasa_res is not None:
+            c, r = kasa_res
+            return (c[0], c[1], r)
+        return None
 
     def get_error(self, data, model):
-        x = data[:, 0]
-        y = data[:, 1]
+        if model is None:
+            return np.full(data.shape[0], np.inf)
         x0, y0, r = model
-        return np.abs((x - x0) ** 2 + (y - y0) ** 2 - r**2)
+        return np.abs(np.linalg.norm(data - np.array([x0, y0]), axis=1) - r)
 
 
 class EllipsoidLeastSquaresModel:
     """3D ellipsoid fitting model. Data shape: (N, 3).
 
-    Uses sympy for symbolic eigenvalue decomposition to recover
-    ellipsoid center, semi-axes, and rotation matrix.
+    Analytical algebraic least-squares model with closed-form eigendecomposition
+    to recover ellipsoid center, semi-axes, and rotation matrix without SymPy.
     """
+
+    @staticmethod
+    def get_design_matrix(pts: np.ndarray) -> np.ndarray:
+        """Vectorized construction of quadratic design matrix (N, 10)."""
+        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+        return np.column_stack([
+            x**2, y**2, z**2,
+            x * y, x * z, y * z,
+            x, y, z,
+            np.ones_like(x),
+        ])
 
     def fit(self, data):
         data_size = len(data)
         if data_size > 100:
             data = data[np.random.choice(data_size, 100, replace=False)]
-        A = []
-        for x in data:
-            A.append(
-                [
-                    x[0] ** 2,
-                    x[1] ** 2,
-                    x[2] ** 2,
-                    x[0] * x[1],
-                    x[0] * x[2],
-                    x[1] * x[2],
-                    x[0],
-                    x[1],
-                    x[2],
-                    1,
-                ]
-            )
-        U, S, V = scipy.linalg.svd(A)
-        model = V[-1]
-        if self.get_ellipsoid_params(model) is None:
+        A = self.get_design_matrix(data)
+        try:
+            _, _, V = scipy.linalg.svd(A, full_matrices=False)
+            model = V[-1]
+            if self.get_ellipsoid_params(model) is None:
+                return None
+            return model
+        except Exception:
             return None
-        return model
 
     def get_error(self, data, model):
         if model is None:
-            return np.array([np.inf] * data.shape[0])
-        A = []
-        for x in data:
-            A.append(
-                [
-                    x[0] ** 2,
-                    x[1] ** 2,
-                    x[2] ** 2,
-                    x[0] * x[1],
-                    x[0] * x[2],
-                    x[1] * x[2],
-                    x[0],
-                    x[1],
-                    x[2],
-                    1,
-                ]
-            )
-        return np.abs((np.array(A) @ np.array(model)[:, np.newaxis])[:, 0])
+            return np.full(data.shape[0], np.inf)
+        A = self.get_design_matrix(data)
+        return np.abs(A @ model)
 
     def get_ellipsoid_params(self, model):
-        """Extract ellipsoid parameters from the implicit equation coefficients.
+        """Extract ellipsoid parameters from implicit equation coefficients.
 
         Returns:
             Tuple (x0, y0, z0, a, b, c, R) where (x0,y0,z0) is the center,
-            (a,b,c) are the semi-axes, and R is the sympy rotation matrix.
+            (a,b,c) are the semi-axes, and R is the 3x3 rotation matrix.
             Returns None if the model does not represent a valid ellipsoid.
         """
         if model is None:
             return None
         a, b, c, d, e, f, g, h, i, j = model
-        x, y, z = sp.symbols("x y z")
-        expr = (
-            a * x**2
-            + b * y**2
-            + c * z**2
-            + d * x * y
-            + e * x * z
-            + f * y * z
-            + g * x
-            + h * y
-            + i * z
-            + j
-        )
-        A0 = sp.Matrix(
-            [
-                [a, d / 2, e / 2],
-                [d / 2, b, f / 2],
-                [e / 2, f / 2, c],
-            ]
-        )
-        eigenvalues = sorted(A0.eigenvals())
-        eigenvectors = sorted(A0.eigenvects(), key=lambda ev: abs(ev[0]))
-        R = (
-            eigenvectors[2][2][0]
-            .col_insert(0, eigenvectors[1][2][0])
-            .col_insert(0, eigenvectors[0][2][0])
-        )
-        if np.linalg.det(np.asarray(R, dtype=np.float64)) + 1 < 1e-3:
+
+        # 3x3 Quadric coefficient matrix and 3x1 linear vector
+        A0 = np.array([
+            [a, d / 2.0, e / 2.0],
+            [d / 2.0, b, f / 2.0],
+            [e / 2.0, f / 2.0, c],
+        ], dtype=np.float64)
+        b0 = np.array([g, h, i], dtype=np.float64)
+
+        # 1. Analytic center: x0 = -0.5 * A0^{-1} * b0
+        try:
+            center = -0.5 * np.linalg.solve(A0, b0)
+        except np.linalg.LinAlgError:
             return None
 
-        xp, yp, zp = sp.symbols("xp yp zp")
-        xyz = sp.Matrix([[xp, yp, zp]]) * R.T
-        trans = expr.subs({x: xyz[0], y: xyz[1], z: xyz[2]})
-        if np.any(np.array(eigenvalues) < 0):
-            trans = trans * (-1)
-
-        var = (xp**2, yp**2, zp**2, xp * yp, xp * zp, yp * zp, xp, yp, zp, 1)
-        expr_trans = trans.expand()
-        coefficients_dict = expr_trans.as_coefficients_dict(*var)
-        for term, coefficient in coefficients_dict.items():
-            if abs(coefficient) < 1e-10:
-                expr_trans = expr_trans.subs(term, 0)
-        if coefficients_dict[1] > 0:
+        # 2. Translated constant: k = j + 0.5 * b0^T * center
+        k = j + 0.5 * np.dot(b0, center)
+        if np.isclose(k, 0.0):
             return None
 
-        coefficients_dict = expr_trans.as_coefficients_dict(*var)
-        coeff_xp2 = float(coefficients_dict[xp**2])
-        coeff_xp = float(coefficients_dict[xp])
-        coeff_yp2 = float(coefficients_dict[yp**2])
-        coeff_yp = float(coefficients_dict[yp])
-        coeff_zp2 = float(coefficients_dict[zp**2])
-        coeff_zp = float(coefficients_dict[zp])
+        # 3. Normalized center quadric: x'^T * (A0 / -k) * x' = 1
+        M = A0 / (-k)
 
-        if coeff_zp2 < 0 or coeff_yp2 < 0 or coeff_xp2 < 0:
+        # 4. Eigendecomposition of real symmetric matrix M
+        try:
+            eigenvals, R = np.linalg.eigh(M)
+        except np.linalg.LinAlgError:
             return None
 
-        x0 = -0.5 * coeff_xp / coeff_xp2
-        y0 = -0.5 * coeff_yp / coeff_yp2
-        z0 = -0.5 * coeff_zp / coeff_zp2
-        x0t, y0t, z0t = (sp.Matrix([x0, y0, z0]).T * R.T).tolist()[0]
+        # Ellipsoid requires strictly positive eigenvalues
+        if np.any(eigenvals <= 1e-7):
+            return None
 
-        Cx = coeff_xp2 * x0**2
-        Cy = coeff_yp2 * y0**2
-        Cz = coeff_zp2 * z0**2
+        # 5. Semi-axes lengths
+        semi_axes = 1.0 / np.sqrt(eigenvals)
 
-        constJ = float(abs(coefficients_dict[1] - Cx - Cy - Cz))
+        # Ensure right-handed coordinate frame
+        if np.linalg.det(R) < 0:
+            R[:, 0] = -R[:, 0]
 
-        sa = np.sqrt(constJ / coeff_xp2)
-        sb = np.sqrt(constJ / coeff_yp2)
-        sc = np.sqrt(constJ / coeff_zp2)
-
-        return (x0t, y0t, z0t, sa, sb, sc, R)
+        return (
+            float(center[0]),
+            float(center[1]),
+            float(center[2]),
+            float(semi_axes[0]),
+            float(semi_axes[1]),
+            float(semi_axes[2]),
+            R,
+        )
 
 
 class NormalLeastSquaresModel:
@@ -548,8 +533,8 @@ def points_to_point_distance(points, point):
     return np.linalg.norm(points - point, ord=2, axis=1)
 
 
-def fit_circle(points, num_iterations, threshold=0.01):
-    """RANSAC-based circle fitting for 2D points.
+def fit_circle(points, num_iterations=100, threshold=0.01):
+    """Circle fitting for 2D points using fast algebraic Kåsa initialization with RANSAC fallback.
 
     Args:
         points: (N, 2) array of 2D points.
@@ -562,9 +547,23 @@ def fit_circle(points, num_iterations, threshold=0.01):
     """
     points = np.asarray(points)
     num_total_points = len(points)
+    if num_total_points < 3:
+        return None, 0, None
+
+    # Fast direct algebraic fit shortcut (0.01 ms)
+    kasa_fit = fit_circle_kasa(points)
+    if kasa_fit is not None:
+        c_kasa, r_kasa = kasa_fit
+        dists = np.abs(points_to_point_distance(points, c_kasa) - r_kasa)
+        inliers_idx = np.where(dists <= threshold)[0]
+        if len(inliers_idx) >= 0.7 * num_total_points:
+            outliers_idx = np.where(dists > threshold)[0]
+            return (c_kasa, r_kasa), len(inliers_idx), outliers_idx
+
     best_circle = None
     best_num_inliers = 0
     remained_points_indices = None
+    num_iterations = min(num_iterations, 100)
 
     for _ in range(num_iterations):
         random_indices = np.random.choice(num_total_points, 3, replace=False)
@@ -585,9 +584,12 @@ def fit_circle(points, num_iterations, threshold=0.01):
                 [x2**2 + y2**2 - x3**2 - y3**2],
             ]
         )
-        X = np.linalg.lstsq(A, B, rcond=None)[0]
-        center = np.array([X[0][0], X[1][0]])
-        r = np.linalg.norm(circle_points[0] - center)
+        try:
+            X = np.linalg.lstsq(A, B, rcond=None)[0]
+            center = np.array([X[0][0], X[1][0]])
+            r = np.linalg.norm(circle_points[0] - center)
+        except Exception:
+            continue
         outliers = np.where(
             abs(points_to_point_distance(points, center) - r) > threshold
         )[0]

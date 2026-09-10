@@ -30,6 +30,8 @@ data/models/*.safetensors
 data/models/owlv2-*/
 data/models/sam_*.pth
 data/logs/
+data/success
+output/
 
 # uv
 uv.lock

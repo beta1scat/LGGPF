@@ -29,6 +29,7 @@ from ..utils.pointcloud import (
     NormalLeastSquaresModel,
     ransac,
     fit_circle,
+    fit_circle_kasa,
     find_orthogonal_vectors,
     pc_normalize,
     generate_cone_points,
@@ -281,27 +282,19 @@ def fit_frustum_cone_by_slice_linear(points, num_layers=10, pcd=None, is_debug=F
         mask = (z >= layer_min) & (z < layer_max)
         layer_pts.append(points[mask])
 
-    # Fit circle to each layer
+    # Fit circle to each layer using fast closed-form Kåsa algebraic fit
     layer_radius = {}
     layer_center = {}
     for layer_idx in range(num_layers):
         layer_idx_pts = layer_pts[layer_idx]
         if len(layer_idx_pts) < 4:
             continue
-        cir_model = CircleLeastSquaresModel()
-        bestmodel, inliers = ransac(
-            layer_idx_pts[:, :2],
-            cir_model,
-            3,
-            200,
-            0.01,
-            10,
-            debug=False,
-            return_all=True,
-        )
-        if bestmodel is not None:
-            layer_radius[layer_idx] = bestmodel[2]
-            layer_center[layer_idx] = bestmodel[:2]
+        circle_res = fit_circle_kasa(layer_idx_pts[:, :2])
+        if circle_res is not None:
+            c, r = circle_res
+            if r > 0.001:  # Physical positive radius
+                layer_radius[layer_idx] = r
+                layer_center[layer_idx] = c
 
     if len(layer_radius) < 0.5 * num_layers:
         return None
@@ -314,8 +307,9 @@ def fit_frustum_cone_by_slice_linear(points, num_layers=10, pcd=None, is_debug=F
     inlier_mask = np.where(ransac_reg.inlier_mask_)[0]
     line_x = np.array(range(num_layers))[:, np.newaxis]
     line_y = ransac_reg.predict(line_x)
-    r2 = line_y[0]  # bottom (min Z)
-    r1 = line_y[-1]  # top (max Z)
+    min_physical_r = max(1e-4, float(np.min(y_fit)) * 0.05) if len(y_fit) > 0 else 1e-4
+    r2 = max(float(line_y[0]), min_physical_r)  # bottom (min Z)
+    r1 = max(float(line_y[-1]), min_physical_r)  # top (max Z)
 
     center_arr = np.array(list(layer_center.values()))
     center = np.array(
@@ -359,20 +353,12 @@ def fit_frustum_cone_by_slice_poly(points, num_layers=10):
         layer_idx_pts = layer_pts[layer_idx]
         if len(layer_idx_pts) < 4:
             continue
-        cir_model = CircleLeastSquaresModel()
-        bestmodel, inliers = ransac(
-            layer_idx_pts[:, :2],
-            cir_model,
-            3,
-            100,
-            0.01,
-            10,
-            debug=False,
-            return_all=True,
-        )
-        if bestmodel is not None:
-            layer_radius[layer_idx] = bestmodel[2]
-            layer_center[layer_idx] = bestmodel[:2]
+        circle_res = fit_circle_kasa(layer_idx_pts[:, :2])
+        if circle_res is not None:
+            c, r = circle_res
+            if r > 0.001:
+                layer_radius[layer_idx] = r
+                layer_center[layer_idx] = c
 
     X_fit = np.array(list(layer_radius.keys()))[:, np.newaxis]
     y_fit = np.array(list(layer_radius.values()))
@@ -386,8 +372,9 @@ def fit_frustum_cone_by_slice_poly(points, num_layers=10):
 
     line_x = np.array(range(num_layers))[:, np.newaxis]
     line_y = model.predict(line_x)
-    r2 = line_y[0]
-    r1 = line_y[-1]
+    min_physical_r = max(1e-4, float(np.min(y_fit)) * 0.05) if len(y_fit) > 0 else 1e-4
+    r2 = max(float(line_y[0]), min_physical_r)
+    r1 = max(float(line_y[-1]), min_physical_r)
 
     center_arr = np.array(list(layer_center.values()))
     center = np.array(
@@ -548,18 +535,18 @@ def fit_frustum_cone_normal(
     R = SO3.TwoVectors(x=vec_x, z=cone_normal)
     pcd_normalized.rotate(R.inv(), center=[0, 0, 0])
 
-    # Fit cone radii by slicing
+    # Fit cone radii by slicing (12 layers provide robust slope regression with low latency)
     if use_poly:
-        r1, r2, height, center = fit_frustum_cone_by_slice_poly(points, 30)
+        r1, r2, height, center = fit_frustum_cone_by_slice_poly(points, 12)
     else:
-        r1, r2, height, center = fit_frustum_cone_by_slice_linear(points, 30, pcd)
+        r1, r2, height, center = fit_frustum_cone_by_slice_linear(points, 12, pcd)
 
     # Scale back to original coordinates
     T = SE3(centroid) * SE3(R) * SE3(np.asarray(center) * m)
     return r1 * m, r2 * m, height * m, T
 
 
-def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0):
+def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0, num_layers=12):
     """Fit a truncated cone using PCA to find the symmetry axis.
 
     Uses PCA on the point positions; the specified principal component
@@ -570,6 +557,7 @@ def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0):
         use_poly: Use polynomial regression for radius estimation.
         is_debug: Show debug visualization.
         z_dir: Index of the PCA component to use as Z axis (0, 1, or 2).
+        num_layers: Number of slicing layers.
 
     Returns:
         Tuple of (r1, r2, height, T).
@@ -588,9 +576,9 @@ def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0):
     pcd_normalized.rotate(R.inv(), center=[0, 0, 0])
 
     if use_poly:
-        r1, r2, height, center = fit_frustum_cone_by_slice_poly(points, 30)
+        r1, r2, height, center = fit_frustum_cone_by_slice_poly(points, num_layers)
     else:
-        r1, r2, height, center = fit_frustum_cone_by_slice_linear(points, 30, pcd)
+        r1, r2, height, center = fit_frustum_cone_by_slice_linear(points, num_layers, pcd)
 
     T = SE3(centroid) * SE3(R) * SE3(np.asarray(center) * m)
     return r1 * m, r2 * m, height * m, T

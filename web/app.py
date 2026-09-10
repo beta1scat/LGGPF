@@ -20,7 +20,14 @@ Or programmatically::
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
+
+# Ensure local 'src' is discoverable on sys.path
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = SCRIPT_DIR.parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from flask import Flask, render_template, request, jsonify
 

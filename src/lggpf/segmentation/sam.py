@@ -22,16 +22,17 @@ class SegmentAnythingModel:
         self.sam = self.sam.to(device=device)
         self.predictor = SamPredictor(self.sam)
 
-    def segment(self, image: np.ndarray, box: np.ndarray) -> np.ndarray:
+    def segment(self, image: np.ndarray, box) -> np.ndarray:
         """Segment an object within a bounding box.
 
         Args:
             image: RGB image as (H, W, 3) numpy array.
-            box: Bounding box as [x1, y1, x2, y2] numpy array.
+            box: Bounding box as [x1, y1, x2, y2] (numpy array or list).
 
         Returns:
             Binary mask as (H, W) boolean numpy array.
         """
+        box = np.asarray(box, dtype=np.float32)
         self.predictor.set_image(image)
         masks, _, _ = self.predictor.predict(
             box=box[None, :],  # Add batch dimension
