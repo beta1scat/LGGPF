@@ -36,6 +36,34 @@ def _require_pinocchio():
 
 
 # =============================================================================
+# RM65 Robot Dynamic and Kinematic Specifications
+# =============================================================================
+
+# RealMan RM65-B 6-DOF Robot kinematic limits (radians)
+# Limits: [-178°, +178°], [-130°, +130°], [-135°, +135°], [-178°, +178°], [-128°, +128°], [-360°, +360°]
+RM65_JOINT_LIMITS_LOWER = np.array(
+    [-3.106686, -2.268928, -2.356194, -3.106686, -2.234021, -6.283185],
+    dtype=np.float64,
+)
+RM65_JOINT_LIMITS_UPPER = np.array(
+    [3.106686, 2.268928, 2.356194, 3.106686, 2.234021, 6.283185],
+    dtype=np.float64,
+)
+
+# Maximum joint velocities (rad/s): [180°/s, 180°/s, 225°/s, 225°/s, 225°/s, 360°/s]
+RM65_VELOCITY_LIMITS = np.array(
+    [np.pi, np.pi, 1.25 * np.pi, 1.25 * np.pi, 1.25 * np.pi, 2.0 * np.pi],
+    dtype=np.float64,
+)
+
+# Maximum joint accelerations (rad/s^2)
+RM65_ACCELERATION_LIMITS = np.array(
+    [10.0, 10.0, 15.0, 15.0, 15.0, 20.0],
+    dtype=np.float64,
+)
+
+
+# =============================================================================
 # Collision detection
 # =============================================================================
 
@@ -46,46 +74,57 @@ class CollisionResult:
     def __init__(self):
         self.is_collision: bool = False
         self.contact_points = None
+        self.min_distance: float = float("inf")
+        self.colliding_pair: tuple = None
 
 
 class CollisionDetector:
-    """Checks collisions between robot links and environment objects.
+    """Checks collisions between robot links and environment objects with clearance margin.
 
     Args:
         robot: A :class:`Robot` instance.
+        safety_margin: Safety clearance distance margin in meters (default: 0.02 m).
     """
 
-    def __init__(self, robot: Robot):
+    def __init__(self, robot: Robot, safety_margin: float = 0.02):
         self.robot = robot
+        self.safety_margin = float(safety_margin)
 
     def check_collision(
-        self, q: np.ndarray, stop_at_first_collision: bool = True
+        self,
+        q: np.ndarray,
+        stop_at_first_collision: bool = True,
+        safety_margin: float | None = None,
     ) -> CollisionResult:
         """Check whether the robot at configuration *q* collides with the environment.
 
         Args:
             q: Joint angles (radians).
             stop_at_first_collision: Return immediately on first collision.
+            safety_margin: Optional override for obstacle clearance margin (meters).
 
         Returns:
-            CollisionResult with ``is_collision`` flag.
+            CollisionResult with ``is_collision`` flag and clearance distance.
         """
         self.robot.update_state(q)
         result = CollisionResult()
+        margin = self.safety_margin if safety_margin is None else float(safety_margin)
 
         for idx_r, robot_obj in enumerate(self.robot.robot_collision_objects):
+            if idx_r == len(self.robot.robot_collision_objects) - 1:
+                T1 = coal.Transform3s()
+                T1.setTranslation(self.robot.data.oMi[-1].translation)
+                T1.setRotation(self.robot.data.oMi[-1].rotation)
+            else:
+                T1 = coal.Transform3s()
+                T1.setTranslation(self.robot.data.oMi[idx_r].translation)
+                T1.setRotation(self.robot.data.oMi[idx_r].rotation)
+
             for env_obj in self.robot.env_collision_objects:
                 request = coal.CollisionRequest()
                 collision_result = coal.CollisionResult()
-
-                if idx_r == len(self.robot.robot_collision_objects) - 1:
-                    T1 = coal.Transform3s()
-                    T1.setTranslation(self.robot.data.oMi[-1].translation)
-                    T1.setRotation(self.robot.data.oMi[-1].rotation)
-                else:
-                    T1 = coal.Transform3s()
-                    T1.setTranslation(self.robot.data.oMi[idx_r].translation)
-                    T1.setRotation(self.robot.data.oMi[idx_r].rotation)
+                if hasattr(request, "security_margin"):
+                    request.security_margin = float(margin)
 
                 coal.collide(
                     robot_obj.collisionGeometry(),
@@ -96,13 +135,40 @@ class CollisionDetector:
                     collision_result,
                 )
                 if collision_result.isCollision():
-                    print(
-                        f"Collision detected: {idx_r}, {robot_obj.name}-{env_obj.name}"
-                    )
                     result.is_collision = True
                     result.contact_points = collision_result.getContacts()
+                    result.colliding_pair = (
+                        getattr(robot_obj, "name", f"link_{idx_r}"),
+                        getattr(env_obj, "name", "environment"),
+                    )
                     if stop_at_first_collision:
                         return result
+
+                # In addition, check Euclidean clearance if distance query is supported
+                if margin > 0.0 and hasattr(coal, "distance"):
+                    dist_req = coal.DistanceRequest()
+                    dist_res = coal.DistanceResult()
+                    try:
+                        coal.distance(
+                            robot_obj.collisionGeometry(),
+                            T1,
+                            env_obj.collisionGeometry(),
+                            env_obj.getTransform(),
+                            dist_req,
+                            dist_res,
+                        )
+                        if dist_res.min_distance < result.min_distance:
+                            result.min_distance = dist_res.min_distance
+                        if dist_res.min_distance < margin:
+                            result.is_collision = True
+                            result.colliding_pair = (
+                                getattr(robot_obj, "name", f"link_{idx_r}"),
+                                getattr(env_obj, "name", "environment"),
+                            )
+                            if stop_at_first_collision:
+                                return result
+                    except Exception:
+                        pass
 
         return result
 
@@ -119,14 +185,33 @@ class CollisionDetector:
         min_distance = float("inf")
         closest_pair = None
 
-        for robot_obj in self.robot.robot_collision_objects:
+        for idx_r, robot_obj in enumerate(self.robot.robot_collision_objects):
+            if idx_r == len(self.robot.robot_collision_objects) - 1:
+                T1 = coal.Transform3s()
+                T1.setTranslation(self.robot.data.oMi[-1].translation)
+                T1.setRotation(self.robot.data.oMi[-1].rotation)
+            else:
+                T1 = coal.Transform3s()
+                T1.setTranslation(self.robot.data.oMi[idx_r].translation)
+                T1.setRotation(self.robot.data.oMi[idx_r].rotation)
+
             for env_obj in self.robot.env_collision_objects:
                 request = coal.DistanceRequest()
                 distance_result = coal.DistanceResult()
-                coal.distance(robot_obj, env_obj, request, distance_result)
-                if distance_result.min_distance < min_distance:
-                    min_distance = distance_result.min_distance
-                    closest_pair = (robot_obj, env_obj)
+                try:
+                    coal.distance(
+                        robot_obj.collisionGeometry(),
+                        T1,
+                        env_obj.collisionGeometry(),
+                        env_obj.getTransform(),
+                        request,
+                        distance_result,
+                    )
+                    if distance_result.min_distance < min_distance:
+                        min_distance = distance_result.min_distance
+                        closest_pair = (robot_obj, env_obj)
+                except Exception:
+                    pass
 
         return min_distance, closest_pair
 
@@ -137,15 +222,44 @@ class CollisionDetector:
 
 
 class JointSpacePlanner:
-    """Quintic polynomial joint-space trajectory planner with collision checking.
+    """Quintic polynomial joint-space trajectory planner with dynamic limits and collision checking.
+
+    Features:
+      - Validates RM65 joint angle, velocity, and angular acceleration bounds.
+      - Automatically scales execution time T if dynamics limits would be exceeded.
+      - Enforces Coal collision safety margin (clearance).
+      - Waypoint adaptive subdivision to prevent discrete tunneling through obstacles.
 
     Args:
         robot: A :class:`Robot` instance.
+        safety_margin: Safety clearance distance margin (meters, default: 0.02).
+        velocity_limits: Per-joint velocity limits (rad/s). Defaults to RM65 specs.
+        acceleration_limits: Per-joint acceleration limits (rad/s^2). Defaults to RM65 specs.
+        max_joint_step: Max allowed joint displacement (rad) between consecutive waypoints (default: 0.05).
     """
 
-    def __init__(self, robot: Robot):
+    def __init__(
+        self,
+        robot: Robot,
+        safety_margin: float = 0.02,
+        velocity_limits: np.ndarray | None = None,
+        acceleration_limits: np.ndarray | None = None,
+        max_joint_step: float = 0.05,
+    ):
         self.robot = robot
-        self.collision_detector = CollisionDetector(robot)
+        self.safety_margin = float(safety_margin)
+        self.collision_detector = CollisionDetector(robot, safety_margin=self.safety_margin)
+        self.velocity_limits = (
+            np.asarray(velocity_limits, dtype=np.float64)
+            if velocity_limits is not None
+            else RM65_VELOCITY_LIMITS.copy()
+        )
+        self.acceleration_limits = (
+            np.asarray(acceleration_limits, dtype=np.float64)
+            if acceleration_limits is not None
+            else RM65_ACCELERATION_LIMITS.copy()
+        )
+        self.max_joint_step = float(max_joint_step)
 
     def add_environment_object(self, obj_type: str, **kwargs):
         """Add an environment obstacle for collision checking.
@@ -166,81 +280,137 @@ class JointSpacePlanner:
         self,
         q_start: np.ndarray,
         q_goal: np.ndarray,
-        n_points: int,
+        n_points: int = 100,
         T: float = 1.0,
         check_collision: bool = True,
+        safety_margin: float | None = None,
+        max_joint_step: float | None = None,
+        auto_time_scaling: bool = True,
+        return_derivatives: bool = False,
     ):
         """Plan a quintic polynomial trajectory from *q_start* to *q_goal*.
 
         The trajectory has zero velocity and acceleration at both endpoints.
+        Dynamically adapts duration T to ensure joint velocity and acceleration bounds.
+        Subdivides path if waypoint-to-waypoint displacement exceeds max_joint_step.
 
         Args:
             q_start: Start joint angles (radians).
             q_goal: Goal joint angles (radians).
-            n_points: Number of waypoints.
-            T: Total trajectory duration (seconds).
+            n_points: Minimum number of waypoints.
+            T: Desired trajectory duration (seconds).
             check_collision: Whether to check each waypoint for collisions.
+            safety_margin: Optional override for obstacle clearance margin (meters).
+            max_joint_step: Max angular change (rad) between adjacent waypoints.
+            auto_time_scaling: Automatically increase T if velocity/acceleration limits exceeded.
+            return_derivatives: If True, returns (q_traj, collision_idx, qd_traj, qdd_traj, actual_T).
 
         Returns:
-            Tuple of (trajectory, collision_indices) where trajectory is
-            (n_points, n_joints) array and collision_indices lists the
-            indices of waypoints in collision.
+            Tuple of (trajectory, collision_indices) by default, matching existing pipeline.
         """
-        t = np.linspace(0, T, n_points)
+        q_start = np.asarray(q_start, dtype=np.float64)
+        q_goal = np.asarray(q_goal, dtype=np.float64)
+        delta_q = np.abs(q_goal - q_start)
+
+        # 1. Kinematic joint limit check
+        num_joints = len(q_start)
+        lower_limits = RM65_JOINT_LIMITS_LOWER[:num_joints]
+        upper_limits = RM65_JOINT_LIMITS_UPPER[:num_joints]
+        if np.any(q_start < lower_limits) or np.any(q_start > upper_limits):
+            print("Warning: q_start exceeds RM65 joint position limits!")
+        if np.any(q_goal < lower_limits) or np.any(q_goal > upper_limits):
+            print("Warning: q_goal exceeds RM65 joint position limits!")
+
+        # 2. Dynamic limits verification & time scaling
+        # For quintic polynomial with zero endpoint derivatives:
+        # peak velocity = 15/8 * |delta_q| / T = 1.875 * |delta_q| / T
+        # peak acceleration = 10*sqrt(3)/3 * |delta_q| / T^2 = 5.7735 * |delta_q| / T^2
+        v_lim = self.velocity_limits[:num_joints]
+        a_lim = self.acceleration_limits[:num_joints]
+
+        req_T_vel = float(np.max(1.875 * delta_q / v_lim)) if np.any(v_lim > 0) else 0.0
+        req_T_acc = float(np.max(np.sqrt(5.7735 * delta_q / a_lim))) if np.any(a_lim > 0) else 0.0
+        min_feasible_T = max(req_T_vel, req_T_acc)
+
+        actual_T = float(T)
+        if auto_time_scaling and min_feasible_T > actual_T:
+            actual_T = float(min_feasible_T * 1.05)  # 5% safety margin
+
+        # 3. Solve analytical quintic polynomial
+        t = np.linspace(0, actual_T, n_points)
         v_start = np.zeros_like(q_start)
         v_goal = np.zeros_like(q_goal)
         a_start = np.zeros_like(q_start)
         a_goal = np.zeros_like(q_goal)
 
-        # Quintic polynomial coefficient matrix
         A = np.array(
             [
                 [0, 0, 0, 0, 0, 1],
-                [T**5, T**4, T**3, T**2, T, 1],
+                [actual_T**5, actual_T**4, actual_T**3, actual_T**2, actual_T, 1],
                 [0, 0, 0, 0, 1, 0],
-                [5 * T**4, 4 * T**3, 3 * T**2, 2 * T, 1, 0],
+                [5 * actual_T**4, 4 * actual_T**3, 3 * actual_T**2, 2 * actual_T, 1, 0],
                 [0, 0, 0, 2, 0, 0],
-                [20 * T**3, 12 * T**2, 6 * T, 2, 0, 0],
-            ]
+                [20 * actual_T**3, 12 * actual_T**2, 6 * actual_T, 2, 0, 0],
+            ],
+            dtype=np.float64,
         )
 
-        q_traj = []
-        for i in range(len(q_start)):
+        q_list, qd_list, qdd_list = [], [], []
+        for i in range(num_joints):
             b = np.array(
-                [q_start[i], q_goal[i], v_start[i], v_goal[i], a_start[i], a_goal[i]]
+                [q_start[i], q_goal[i], v_start[i], v_goal[i], a_start[i], a_goal[i]],
+                dtype=np.float64,
             )
             x = np.linalg.solve(A, b)
-            q_joint = np.array(
-                [
-                    x[0] * tt**5
-                    + x[1] * tt**4
-                    + x[2] * tt**3
-                    + x[3] * tt**2
-                    + x[4] * tt
-                    + x[5]
-                    for tt in t
-                ]
-            )
-            q_traj.append(q_joint)
+            pos = x[0] * t**5 + x[1] * t**4 + x[2] * t**3 + x[3] * t**2 + x[4] * t + x[5]
+            vel = 5 * x[0] * t**4 + 4 * x[1] * t**3 + 3 * x[2] * t**2 + 2 * x[3] * t + x[4]
+            acc = 20 * x[0] * t**3 + 12 * x[1] * t**2 + 6 * x[2] * t + 2 * x[3]
+            q_list.append(pos)
+            qd_list.append(vel)
+            qdd_list.append(acc)
 
-        q_traj = np.array(q_traj).T
+        q_traj = np.array(q_list).T
+        qd_traj = np.array(qd_list).T
+        qdd_traj = np.array(qdd_list).T
+
+        # 4. Waypoint subdivision for dense collision checking
+        step_threshold = self.max_joint_step if max_joint_step is None else float(max_joint_step)
+        subdivided_traj = [q_traj[0]]
+        for k in range(len(q_traj) - 1):
+            curr_q = q_traj[k]
+            next_q = q_traj[k + 1]
+            max_disp = float(np.max(np.abs(next_q - curr_q)))
+            if max_disp > step_threshold:
+                sub_steps = int(np.ceil(max_disp / step_threshold))
+                for s in range(1, sub_steps):
+                    alpha = s / sub_steps
+                    subdivided_traj.append((1.0 - alpha) * curr_q + alpha * next_q)
+            subdivided_traj.append(next_q)
+
+        final_traj = np.array(subdivided_traj)
+
+        # 5. Collision checking with safety margin
         collision_idx = []
-
+        margin = self.safety_margin if safety_margin is None else float(safety_margin)
         if check_collision:
-            for i, q in enumerate(q_traj):
-                if self.collision_detector.check_collision(q).is_collision:
-                    print(f"Waypoint {i} has collision")
+            for i, q in enumerate(final_traj):
+                res = self.collision_detector.check_collision(q, safety_margin=margin)
+                if res.is_collision:
                     collision_idx.append(i)
 
-        return q_traj, collision_idx
+        if return_derivatives:
+            return final_traj, collision_idx, qd_traj, qdd_traj, actual_T
+        return final_traj, collision_idx
 
     def get_collision_distance(self, q: np.ndarray):
         """Compute minimum distance from robot to environment at configuration *q*."""
         return self.collision_detector.get_collision_distance(q)
 
-    def check_collision(self, q: np.ndarray) -> CollisionResult:
+    def check_collision(
+        self, q: np.ndarray, safety_margin: float | None = None
+    ) -> CollisionResult:
         """Check collision at configuration *q*."""
-        return self.collision_detector.check_collision(q)
+        return self.collision_detector.check_collision(q, safety_margin=safety_margin)
 
 
 # =============================================================================

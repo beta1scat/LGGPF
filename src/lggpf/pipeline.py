@@ -92,6 +92,11 @@ class GraspingPipeline:
         traj_cfg = pipe_cfg.get("trajectory", {})
         self.num_path_joints = traj_cfg.get("num_path_joints", 100)
         self.path_time = traj_cfg.get("path_time", 3.0)
+        self.safety_margin = traj_cfg.get("safety_margin", 0.02)
+        self.max_joint_step = traj_cfg.get("max_joint_step", 0.05)
+        self.auto_time_scaling = traj_cfg.get("auto_time_scaling", True)
+        self.velocity_limits = traj_cfg.get("velocity_limits", None)
+        self.acceleration_limits = traj_cfg.get("acceleration_limits", None)
 
         # Language type-selection keywords
         lang_cfg = pipe_cfg.get("language_type_map", {})
@@ -211,7 +216,13 @@ class GraspingPipeline:
         )
 
         # Trajectory planner
-        self.models["planner"] = JointSpacePlanner(robot)
+        self.models["planner"] = JointSpacePlanner(
+            robot,
+            safety_margin=self.safety_margin,
+            velocity_limits=self.velocity_limits,
+            acceleration_limits=self.acceleration_limits,
+            max_joint_step=self.max_joint_step,
+        )
 
         logger.info("All models loaded successfully.")
 
@@ -705,18 +716,31 @@ class GraspingPipeline:
         logger.info("Inverse kinematics succeeded.")
         q_goal = q_goal * DEGREE_TO_RADIAN
 
-        # Plan quintic polynomial trajectory
-        trajectory, collision_idx = planner.quintic_trajectory(
-            q_start, q_goal, n_points=self.num_path_joints, T=self.path_time
+        # Plan quintic polynomial trajectory with dynamics and clearance bounds
+        trajectory, collision_idx, _, _, actual_T = planner.quintic_trajectory(
+            q_start,
+            q_goal,
+            n_points=self.num_path_joints,
+            T=self.path_time,
+            safety_margin=self.safety_margin,
+            max_joint_step=self.max_joint_step,
+            auto_time_scaling=self.auto_time_scaling,
+            return_derivatives=True,
         )
-        logger.info("Trajectory planning completed.")
+        logger.info(
+            "Trajectory planning completed (duration: %.2fs, waypoints: %d, collisions: %d).",
+            actual_T,
+            len(trajectory),
+            len(collision_idx),
+        )
 
         if len(collision_idx) == 0:
             self.data["trajectory_safe"] = trajectory
             logger.info("Trajectory is collision-free. Visualizing...")
+            dt = actual_T / max(len(trajectory), 1)
             for q in trajectory:
                 robot.update_state(q)
-                time.sleep(self.path_time / self.num_path_joints)
+                time.sleep(dt)
             logger.info("Safe trajectory visualization complete.")
             return True
         else:
