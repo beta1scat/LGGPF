@@ -91,6 +91,12 @@ pipeline:
   trajectory:
     num_path_joints: 100
     path_time: 3.0  # seconds
+    safety_margin: 0.02  # meters (Coal collision clearance margin)
+    max_joint_step: 0.05  # radians (~2.86 deg, max joint step before subdivision)
+    auto_time_scaling: true  # scale trajectory duration if velocity/acceleration limits exceeded
+    velocity_limits: [3.14159, 3.14159, 3.92699, 3.92699, 3.92699, 6.28318]  # rad/s for RM65
+    acceleration_limits: [10.0, 10.0, 15.0, 15.0, 15.0, 20.0]  # rad/s^2 for RM65
+
 
   # Language-guided type selection keyword mapping
   # "cup"/"bowl"/"tube" -> cone types, "ball" -> ellipsoid, else -> cuboid
