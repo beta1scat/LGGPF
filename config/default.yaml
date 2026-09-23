@@ -94,8 +94,8 @@ pipeline:
     safety_margin: 0.02  # meters (Coal collision clearance margin)
     max_joint_step: 0.05  # radians (~2.86 deg, max joint step before subdivision)
     auto_time_scaling: true  # scale trajectory duration if velocity/acceleration limits exceeded
-    velocity_limits: [3.14159, 3.14159, 3.92699, 3.92699, 3.92699, 6.28318]  # rad/s for RM65
-    acceleration_limits: [10.0, 10.0, 15.0, 15.0, 15.0, 20.0]  # rad/s^2 for RM65
+    velocity_limits: [3.14159, 3.14159, 3.92699, 3.92699, 3.92699, 3.92699]  # rad/s for RM65 (180, 180, 225, 225, 225, 225 deg/s)
+    acceleration_limits: [10.47198, 10.47198, 10.47198, 10.47198, 10.47198, 10.47198]  # rad/s^2 for RM65 (600 deg/s^2)
 
 
   # Language-guided type selection keyword mapping

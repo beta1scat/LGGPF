@@ -50,15 +50,17 @@ RM65_JOINT_LIMITS_UPPER = np.array(
     dtype=np.float64,
 )
 
-# Maximum joint velocities (rad/s): [180°/s, 180°/s, 225°/s, 225°/s, 225°/s, 360°/s]
+# Maximum joint velocities (rad/s): [180°/s, 180°/s, 225°/s, 225°/s, 225°/s, 225°/s]
+# Official specs: J1-J2 max 180°/s (pi rad/s), J3-J6 max 225°/s (1.25*pi rad/s)
 RM65_VELOCITY_LIMITS = np.array(
-    [np.pi, np.pi, 1.25 * np.pi, 1.25 * np.pi, 1.25 * np.pi, 2.0 * np.pi],
+    [np.pi, np.pi, 1.25 * np.pi, 1.25 * np.pi, 1.25 * np.pi, 1.25 * np.pi],
     dtype=np.float64,
 )
 
-# Maximum joint accelerations (rad/s^2)
+# Maximum joint accelerations (rad/s^2): 600°/s^2 = 10.4719755 rad/s^2
+# Official specs: factory default and max 600°/s^2 for all joints
 RM65_ACCELERATION_LIMITS = np.array(
-    [10.0, 10.0, 15.0, 15.0, 15.0, 20.0],
+    [600.0 * np.pi / 180.0] * 6,
     dtype=np.float64,
 )
 

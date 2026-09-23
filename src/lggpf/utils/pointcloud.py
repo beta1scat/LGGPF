@@ -257,11 +257,21 @@ class EllipsoidLeastSquaresModel:
             return None
 
         # Ellipsoid requires strictly positive eigenvalues
-        if np.any(eigenvals <= 1e-7):
+        if np.any(eigenvals <= 1e-4):
             return None
 
         # 5. Semi-axes lengths
         semi_axes = 1.0 / np.sqrt(eigenvals)
+
+        # Physics/geometry sanity check in normalized coordinates:
+        # Normalized points are bounded within [-1, 1], so semi-axes > 3.0 or aspect ratio > 5.0
+        # indicates degenerate flat quadric or thin needle that ruins physical grasp estimation.
+        if np.any(~np.isfinite(semi_axes)) or np.any(semi_axes <= 0.02) or np.any(semi_axes > 3.0):
+            return None
+        if (np.max(semi_axes) / np.min(semi_axes)) > 5.0:
+            return None
+        if np.linalg.norm(center) > 1.5:
+            return None
 
         # Ensure right-handed coordinate frame
         if np.linalg.det(R) < 0:

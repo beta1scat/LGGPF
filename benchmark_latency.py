@@ -658,17 +658,20 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
     pcd = typ["pointcloud"]
     grp = typ["grasp"]
     trj = typ["trajectory"]
-    tot_cuboid = stats_dict["cuboid"]["total"]
-    core_cuboid = stats_dict["cuboid"]["core_planning"]
+    tot_all = typ["total"]
+    core_all = typ["core_planning"]
 
     def fmt_cell(s):
         if s["count"] == 0:
             return "N/A"
+        # 当标准差四舍五入退化为 0.0 时（如亚毫秒级五次多项式规划），自适应提升至两位小数，以符合计量规范并避免输出 \pm 0.0
+        if round(s["std"], 1) == 0.0 and s["std"] > 0:
+            return f"${s['mean']:.2f} \\pm {s['std']:.2f}$ (${s['min']:.2f}\\text{{--}}{s['max']:.2f}$)"
         return f"${s['mean']:.1f} \\pm {s['std']:.1f}$ (${s['min']:.1f}\\text{{--}}{s['max']:.1f}$)"
 
     latex = rf"""\begin{{table}}[htbp]
         \centering
-        \caption{{LGGPF 语言引导几何感知与抓取流水线各功能模块运行耗时实测统计表}}
+        \caption[LGGPF抓取流水线模块耗时统计表]{{LGGPF 语言引导几何感知与抓取流水线各功能模块运行耗时实测统计表}}
         \label{{tab:ch5_runtime}}
         \zihao{{5}}
         \setlength{{\tabcolsep}}{{4.5pt}}
@@ -685,13 +688,13 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
                 \midrule
                 点云针孔逆投影与滤波     & {fmt_cell(pcd)} & $\mathcal{{O}}(N \log N)$                           & 像元透视逆变换与 KD-Tree 离群点统计滤除 \\
                 长方体基元快速拟合       & {fmt_cell(cuboid_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 单模型解析平面法向与 OBB 几何尺寸解算 \\
-                圆锥台多拓扑竞争拟合     & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{topo}}}} K_{{\mathrm{{cir}}}} N)$ & 遍历切片圆代数拟合、母线回归与 Chamfer 测距 \\
+                圆锥台多拓扑竞争拟合     & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{topo}}}} K_{{\mathrm{{cir}}}} N)$ & 遍历切片圆代数拟合、母线回归与双向 Chamfer 距离计算 \\
                 椭球体闭式解析特征拟合   & {fmt_cell(ellip_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot 3^3)$      & 实对称矩阵闭式特征值分解与向量化 RANSAC \\
                 候选位姿生成与物理过滤   & {fmt_cell(grp)} & $\mathcal{{O}}(N_{{\mathrm{{cand}}}})$                   & 几何限位、解析 IK 可达性与 Coal 碰撞干涉检测 \\
                 五次多项式平滑轨迹规划   & {fmt_cell(trj)} & $\mathcal{{O}}(N_{{\mathrm{{joints}}}} \cdot 6)$         & 闭式多项式矩阵求逆（式\eqref{{eq:ch5_quintic_sol}}）与路径离散采样 \\
                 \midrule
-                \textbf{{核心抓取规划层耗时（本文方法）}} & \textbf{{{fmt_cell(core_cuboid)}}} & -- & \textbf{{常规长方体工况规划层仅需约 0.31 s}} \\
-                \textbf{{端到端系统级总耗时（含视觉模型）}} & \textbf{{{fmt_cell(tot_cuboid)}}} & -- & \textbf{{常规长方体工况端到端全流程总时延约 0.84 s（1 秒以内快速在线响应）}} \\
+				\textbf{{核心抓取规划层耗时（全类别）}} & \textbf{{{fmt_cell(core_all)}}} & -- & \textbf{{12次单物体记录的跨类别统计}} \\
+				\textbf{{端到端系统级总耗时（全类别）}} & \textbf{{{fmt_cell(tot_all)}}} & -- & \textbf{{含视觉前端、点云、拟合、抓取与轨迹阶段}} \\
                 \bottomrule
         \end{{tabular}}
 \end{{table}}"""
