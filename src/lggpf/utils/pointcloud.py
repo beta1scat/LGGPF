@@ -9,6 +9,7 @@ import numpy as np
 import open3d as o3d
 import scipy
 import scipy.optimize
+from scipy.spatial import cKDTree
 import sympy as sp
 from spatialmath import SE3, SO3
 
@@ -845,8 +846,8 @@ def check_pick_pose_for_2finger_gripper_range(pcd, poses, finger_range):
 
 
 def compute_trimmed_distance(
-    pcd: o3d.geometry.PointCloud,
-    fit_pcd: o3d.geometry.PointCloud,
+    pcd,
+    fit_pcd,
     inlier_ratio: float = 0.90,
 ) -> float:
     """Compute robust trimmed point cloud distance (focusing on the closest inlier_ratio fraction).
@@ -855,18 +856,22 @@ def compute_trimmed_distance(
     Evaluates how closely the fitted primitive surface matches the true visible workpiece surface.
 
     Args:
-        pcd: Observed point cloud from depth camera.
-        fit_pcd: Synthetic point cloud generated from fitted primitive.
+        pcd: Observed point cloud (o3d.geometry.PointCloud or (N, 3) ndarray).
+        fit_pcd: Synthetic point cloud from fitted primitive (o3d.geometry.PointCloud or (M, 3) ndarray).
         inlier_ratio: Ratio of closest points to retain (default 0.90).
 
     Returns:
-        Mean distance (in mm) of the closest inlier_ratio fraction of points.
+        Mean distance of the closest inlier_ratio fraction of points.
     """
-    if pcd is None or fit_pcd is None or len(pcd.points) == 0 or len(fit_pcd.points) == 0:
+    if pcd is None or fit_pcd is None:
         return float("inf")
-    d1 = np.asarray(pcd.compute_point_cloud_distance(fit_pcd), dtype=np.float64)
-    if len(d1) == 0:
+    pts1 = np.asarray(pcd.points if hasattr(pcd, "points") else pcd, dtype=np.float64)
+    pts2 = np.asarray(fit_pcd.points if hasattr(fit_pcd, "points") else fit_pcd, dtype=np.float64)
+    if pts1.size == 0 or pts2.size == 0:
         return float("inf")
+
+    tree = cKDTree(pts2)
+    d1, _ = tree.query(pts1, k=1)
     d1_sorted = np.sort(d1)
     k = max(1, int(round(inlier_ratio * len(d1_sorted))))
     return float(np.mean(d1_sorted[:k]))

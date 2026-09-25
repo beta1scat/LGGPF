@@ -821,12 +821,20 @@ def fit_frustum_cone_adaptive(
     Returns:
         Tuple of (r1, r2, height, T, method_name, residual)
     """
+    # Downsample dense point clouds to ~2048 points for fast, robust geometric axis/parameter fitting
+    n_pts = len(pcd.points) if hasattr(pcd, "points") else len(pcd)
+    if n_pts > 2048:
+        step = max(1, n_pts // 2048)
+        pcd_fit = pcd.uniform_down_sample(every_k_points=step) if hasattr(pcd, "uniform_down_sample") else pcd[::step]
+    else:
+        pcd_fit = pcd
+
     hypotheses = [
-        ("normal", lambda: fit_frustum_cone_normal(pcd, use_poly=use_poly, plane_t=0.005, normal_t=0.02, use_plane_normal=True)),
-        ("normal_ransac", lambda: fit_frustum_cone_normal(pcd, use_poly=use_poly, plane_t=0.01, normal_t=0.02, use_plane_normal=False)),
-        ("pca_z0", lambda: fit_frustum_cone_pca(pcd, use_poly=use_poly, z_dir=0)),
-        ("pca_z2", lambda: fit_frustum_cone_pca(pcd, use_poly=use_poly, z_dir=2)),
-        ("obb", lambda: fit_frustum_cone_obb(pcd)),
+        ("pca_z0", lambda: fit_frustum_cone_pca(pcd_fit, use_poly=use_poly, z_dir=0)),
+        ("pca_z2", lambda: fit_frustum_cone_pca(pcd_fit, use_poly=use_poly, z_dir=2)),
+        ("normal", lambda: fit_frustum_cone_normal(pcd_fit, use_poly=use_poly, plane_t=0.005, normal_t=0.02, use_plane_normal=True)),
+        ("normal_ransac", lambda: fit_frustum_cone_normal(pcd_fit, use_poly=use_poly, plane_t=0.01, normal_t=0.02, use_plane_normal=False)),
+        ("obb", lambda: fit_frustum_cone_obb(pcd_fit)),
     ]
 
     best_fit = None
