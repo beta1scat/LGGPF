@@ -277,7 +277,8 @@ class ShapeClassifier:
         if n == target_n:
             sampled = normalized
         elif n > target_n:
-            indices = np.linspace(0, n - 1, target_n, dtype=np.int64)
+            rng = np.random.default_rng(3407)
+            indices = rng.choice(n, size=target_n, replace=False)
             sampled = normalized[indices]
         else:
             rng = np.random.default_rng(3407)
@@ -308,6 +309,42 @@ class ShapeClassifier:
         pts_with_normals = torch.cat((points, normals), dim=1)
         return pts_with_normals.permute(1, 0).unsqueeze(0).float().to(self.device)
 
+    def predict_ranked(
+        self, pcd: o3d.geometry.PointCloud, cls: str | None = None
+    ) -> list[tuple[str, float]]:
+        """Classify a point cloud and return all categories ranked by softmax confidence.
+
+        Returns:
+            List of (category_code, confidence_score) sorted descending by score.
+            Example: [("1", 0.89), ("0", 0.08), ("2", 0.03)]
+        """
+        if self.model_type == "none" or self.model is None:
+            default_cat = cls if cls is not None else "0"
+            return [(default_cat, 1.0)]
+
+        if len(pcd.points) == 0:
+            logger.warning("Empty point cloud passed to predict_ranked(); defaulting to '0'.")
+            return [("0", 1.0), ("1", 0.0), ("2", 0.0)]
+
+        if self.model_type == "mamba3d":
+            input_tensor = self._preprocess_mamba3d(pcd)
+            with torch.no_grad():
+                logits = self.model(input_tensor)
+                probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+            ranked_indices = np.argsort(-probs)
+            return [(CLASS_MAP.get(int(idx), "0"), float(probs[idx])) for idx in ranked_indices]
+
+        elif self.model_type == "pointnet2":
+            input_tensor = self._preprocess_pointnet2(pcd)
+            with torch.no_grad():
+                pred, _ = self.model(input_tensor)
+                probs = torch.softmax(pred, dim=1).squeeze(0).cpu().numpy()
+            ranked_indices = np.argsort(-probs)
+            return [(CLASS_MAP.get(int(idx), "0"), float(probs[idx])) for idx in ranked_indices]
+
+        default_cat = cls if cls is not None else "0"
+        return [(default_cat, 1.0)]
+
     def predict(self, pcd: o3d.geometry.PointCloud, cls: str | None = None) -> str:
         """Classify a point cloud into a canonical shape category.
 
@@ -321,28 +358,8 @@ class ShapeClassifier:
         Returns:
             Class code string: '0', '1', or '2'.
         """
-        if self.model_type == "none" or self.model is None:
-            return cls if cls is not None else "0"
-
-        if len(pcd.points) == 0:
-            logger.warning("Empty point cloud passed to predict(); defaulting to '0'.")
-            return "0"
-
-        if self.model_type == "mamba3d":
-            input_tensor = self._preprocess_mamba3d(pcd)
-            with torch.no_grad():
-                logits = self.model(input_tensor)
-                pred_idx = int(logits.argmax(dim=-1).item())
-            return CLASS_MAP.get(pred_idx, "0")
-
-        elif self.model_type == "pointnet2":
-            input_tensor = self._preprocess_pointnet2(pcd)
-            with torch.no_grad():
-                pred, _ = self.model(input_tensor)
-                pred_idx = int(pred.argmax(dim=1).item())
-            return CLASS_MAP.get(pred_idx, "0")
-
-        return cls if cls is not None else "0"
+        ranked = self.predict_ranked(pcd, cls)
+        return ranked[0][0] if ranked else (cls if cls is not None else "0")
 
 
 # Backward compatibility alias

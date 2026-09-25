@@ -45,6 +45,7 @@ from .utils.pointcloud import (
     view_coordinate,
     filter_pose_by_axis_diff,
     check_pick_pose_for_2finger_gripper_range,
+    compute_trimmed_distance,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class GraspingPipeline:
         self.detection_threshold = pipe_cfg.get("detection_threshold", 0.1)
         self.segmentation_max_points = pipe_cfg.get("segmentation_max_points", 10000)
         self.fitting_synthetic_points = pipe_cfg.get("fitting_synthetic_points", 5000)
+        self.fitting_threshold_exit = pipe_cfg.get("fitting_threshold_exit", 2.0)
 
         grasp_cfg = pipe_cfg.get("grasp", {})
         self.z_axis_filter_threshold = grasp_cfg.get(
@@ -421,9 +423,11 @@ class GraspingPipeline:
     def classify_and_fit(self) -> dict[str, Any]:
         """Classify segmented point cloud with ShapeClassifier and fit shape primitive.
 
-        Replaces language keyword matching with neural network geometric
-        classification (Mamba3D / PointNet2). Based on the predicted category,
-        executes targeted high-precision primitive fitting.
+        Executes prior-guided sequential threshold early-exit geometric primitive fitting:
+        1. Predicts shape category ranking via neural classifier (Mamba3D / PointNet2).
+        2. Fits the primary candidate and checks bilateral Chamfer distance residual.
+        3. If residual <= tau_exit (default 15 mm), exits immediately (early exit).
+        4. If residual > tau_exit, tests secondary hypothesis to prevent geometric distortion.
 
         Returns:
             Dict with keys: ``category``, ``params`` (doubled sizes), and
@@ -433,90 +437,124 @@ class GraspingPipeline:
         pcd = self.data["pcd"]
         classifier = self.models["classification"]
 
-        # 1. Neural geometric classification (Mamba3D / PointNet2)
-        pred_cat = classifier.predict(pcd)
+        # 1. Neural geometric classification (Mamba3D / PointNet2) with ranking
+        ranked_categories = classifier.predict_ranked(pcd)
+        pred_cat = ranked_categories[0][0] if ranked_categories else "0"
         self.data["predicted_category"] = pred_cat
-        logger.info("Neural classifier predicted shape primitive: %s", pred_cat)
+        logger.info(
+            "Neural classifier predicted shape primitive: %s (ranking: %s)",
+            pred_cat,
+            [(c, f"{p:.2f}") for c, p in ranked_categories],
+        )
 
-        # 2. Targeted candidate fitting topologies for the predicted category
-        if pred_cat == "0":
-            type_list = ["0"]
-        elif pred_cat == "1":
-            type_list = ["11", "13"]
-        elif pred_cat == "2":
-            type_list = ["2"]
-        else:
-            type_list = ["0"]
+        tau_exit = getattr(self, "fitting_threshold_exit", 2.0)  # 2.0 mm default exit threshold
+        best_target = pred_cat
+        best_params = []
+        best_chamfer = float("inf")
+        best_pcd_fit = None
 
-        total_points = self.fitting_synthetic_points
-
-        params_list: list[Any] = []
-        pcd_fit_list: list[o3d.geometry.PointCloud | None] = []
-        min_dist_list: list[float] = []
-
-        for tp in type_list:
-            logger.info("Trying fitting type: %s", tp)
+        # 2. Prior-guided sequential threshold early-exit
+        for rank_idx, (cat_code, conf) in enumerate(ranked_categories):
             try:
-                params = fbg.fitting(pcd, tp)
-            except Exception:
-                logger.warning("Fitting type %s failed, skipping.", tp)
-                params_list.append(None)
-                pcd_fit_list.append(None)
-                min_dist_list.append(np.inf)
+                cand_params = fbg.fitting(pcd, cat_code)
+            except Exception as exc:
+                logger.warning("Targeted fitting for type %s failed: %s", cat_code, exc)
                 continue
 
-            if params == []:
-                logger.warning("Fitting type %s returned empty params, skipping.", tp)
-                params_list.append(None)
-                pcd_fit_list.append(None)
-                min_dist_list.append(np.inf)
+            if not cand_params:
                 continue
 
-            params_list.append(params)
-
-            # Generate synthetic point cloud for comparison
-            if tp in ("0", "01"):
-                points = generate_cube_points(
-                    np.array(params[:3]) * 2, total_points=total_points
+            # Generate synthetic points to evaluate Chamfer distance (2000 points optimal balance)
+            eval_points = 2000
+            if cat_code in ("0", "01"):
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=eval_points
                 )
-            elif tp in ("1", "11", "12", "13", "14"):
-                r1, r2, height, _ = params
-                points = generate_cone_points(
+            elif cat_code in ("1", "11", "12", "13", "14"):
+                r1, r2, h, _ = cand_params
+                pts = generate_cone_points(
                     r_bottom=r2,
-                    r_top_ratio=r1 / r2,
-                    height=height,
-                    total_points=total_points,
+                    r_top_ratio=r1 / r2 if r2 > 1e-6 else 1.0,
+                    height=h,
+                    total_points=eval_points,
                 )
-            elif tp == "2":
-                points = generate_ellipsoid_points(
-                    *params[:3], total_points=total_points
+            elif cat_code == "2":
+                pts = generate_ellipsoid_points(
+                    *cand_params[:3], total_points=eval_points
                 )
             else:
-                logger.warning("Unsupported fitting type: %s", tp)
-                pcd_fit_list.append(None)
-                min_dist_list.append(np.inf)
-                continue
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=eval_points
+                )
 
-            pcd_fit = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-            pcd_fit_list.append(pcd_fit)
+            cand_fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+            dist_cloud = o3d.geometry.PointCloud(cand_fit_cloud)
+            dist_cloud.transform(cand_params[-1])
+            cd = compute_trimmed_distance(pcd, dist_cloud, inlier_ratio=0.90)
 
-            # Compute bidirectional mean distance as quality metric
-            dist_pcd_fit = o3d.geometry.PointCloud(pcd_fit)
-            dist_pcd_fit.transform(params[-1])
-            min_dist1 = pcd.compute_point_cloud_distance(dist_pcd_fit)
-            min_dist2 = dist_pcd_fit.compute_point_cloud_distance(pcd)
-            dist_score = np.mean(min_dist1) + np.mean(min_dist2)
-            logger.info("Type %s distance score: %.4f", tp, dist_score)
-            min_dist_list.append(dist_score)
+            if cd < best_chamfer:
+                best_chamfer = cd
+                best_target = cat_code
+                best_params = cand_params
 
-        # Select best fit
-        min_idx = int(np.argmin(min_dist_list))
-        cls = type_list[min_idx]
-        pcd_fit = pcd_fit_list[min_idx]
+            # Threshold Early-Exit condition (门限早停: <= 2.0 mm 鲁棒截断表面误差)
+            if cd <= tau_exit:
+                logger.info(
+                    "Threshold early-exit satisfied at rank %d (type=%s, conf=%.2f, trimmed_dist=%.4f <= %.4f)",
+                    rank_idx + 1,
+                    cat_code,
+                    conf,
+                    cd,
+                    tau_exit,
+                )
+                break
 
-        self.data["category"] = cls
-        self.data["params"] = params_list[min_idx]
+        # Fallback to cuboid if all fits failed
+        if not best_params:
+            logger.warning("All candidate fits failed; falling back to cuboid '0'.")
+            best_target = "0"
+            try:
+                best_params = fbg.fitting(pcd, "0")
+            except Exception as exc:
+                logger.error("Fallback cuboid fitting also failed: %s", exc)
+                raise RuntimeError("Geometric shape fitting failed completely.")
+
+        target_type = best_target
+        params = best_params
+
+        # Final high-density synthetic point cloud generation (5000 points) for metrics and artifact
+        total_points = self.fitting_synthetic_points
+        if target_type in ("0", "01"):
+            points = generate_cube_points(
+                np.array(params[:3]) * 2, total_points=total_points
+            )
+        elif target_type in ("1", "11", "12", "13", "14"):
+            r1, r2, height, _ = params
+            points = generate_cone_points(
+                r_bottom=r2,
+                r_top_ratio=r1 / r2 if r2 > 1e-6 else 1.0,
+                height=height,
+                total_points=total_points,
+            )
+        elif target_type == "2":
+            points = generate_ellipsoid_points(
+                *params[:3], total_points=total_points
+            )
+        else:
+            points = generate_cube_points(
+                np.array(params[:3]) * 2, total_points=total_points
+            )
+
+        pcd_fit = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        dist_pcd_fit = o3d.geometry.PointCloud(pcd_fit)
+        dist_pcd_fit.transform(params[-1])
+        chamfer_dist = compute_trimmed_distance(pcd, dist_pcd_fit, inlier_ratio=0.90)
+
+        self.data["category"] = target_type
+        self.data["params"] = params
         self.data["pcd_fit"] = pcd_fit
+        self.data["chamfer_distance"] = chamfer_dist
+        self.data["min_dist"] = chamfer_dist
 
         # Visualization
         if pcd_fit is not None:
@@ -530,11 +568,18 @@ class GraspingPipeline:
                 )
 
         params_display = [round(x * 2, 2) for x in self.data["params"][:-1]]
-        logger.info("Best fit: type=%s, params=%s", cls, params_display)
+        logger.info(
+            "Fit result: type=%s, method=%s, params=%s, Chamfer distance=%.4f",
+            target_type,
+            fbg.last_method,
+            params_display,
+            chamfer_dist,
+        )
         return {
-            "category": cls[0],
-            "category_code": cls,
+            "category": target_type[0],
+            "category_code": target_type,
             "params": params_display,
+            "chamfer_distance": chamfer_dist,
         }
 
     # =========================================================================
@@ -618,14 +663,23 @@ class GraspingPipeline:
             t=self.z_axis_filter_threshold,
             sorted=True,
         )
+        downward_poses = list(ppose)
 
         # Check 2-finger gripper feasibility (skip for side grasps)
         if not is_side:
             pcd_model = o3d.geometry.PointCloud(self.data["pcd_fit"])
             pcd_model.transform(self.T_BC_Cali * t_OC)
-            ppose = check_pick_pose_for_2finger_gripper_range(
+            filtered = check_pick_pose_for_2finger_gripper_range(
                 pcd_model, ppose, self.finger_range
             )
+            if len(filtered) == 0 and len(downward_poses) > 0:
+                logger.warning(
+                    "All poses rejected by gripper aperture check; falling back to %d downward poses.",
+                    len(downward_poses),
+                )
+                ppose = downward_poses
+            else:
+                ppose = filtered
 
         self.data["pick_poses"] = ppose
 

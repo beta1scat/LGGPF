@@ -5,7 +5,7 @@ interactive 3D views for Chapter 5 of the doctoral dissertation:
   1. Stage 1: OWLv2 Open-Vocabulary Target Localization (RGB overlay + query + conf)
   2. Stage 2: SAM Prompted Instance Segmentation (Alpha blend mask + contour)
   3. Stage 3: Depth Back-Projection & Surface Normal Field (3D point cloud + normal quiver)
-  4. Stage 4: Multi-Primitive Competitive Fitting (Cuboid/Cone/Ellipsoid wireframe + {O} frame)
+  4. Stage 4: Neural-Guided Single-Shot Primitive Fitting (Cuboid/Cone/Ellipsoid wireframe + {O} frame)
   5. Stage 5: Grasp Manifold Generation & Gripper Wireframe Verification (Parallel 2-finger model)
   6. Stage 6: Quintic Polynomial Trajectory Planning (Cartesian path + joint profiles)
 
@@ -20,10 +20,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +40,34 @@ import numpy as np
 import open3d as o3d
 from spatialmath import SE3, SO3
 
-# Configure publication typography: SimSun (宋体) for Chinese, Times New Roman for English/Math
-matplotlib.rcParams['font.sans-serif'] = ['SimSun', 'Times New Roman']
-matplotlib.rcParams['font.serif'] = ['Times New Roman', 'SimSun']
+# Configure publication typography: dynamically load CJK (SimSun/YaHei) & Times New Roman
+import matplotlib.font_manager as fm
+
+_FONT_CANDIDATE_DIRS = [
+    Path("/mnt/c/Windows/Fonts"),
+    Path("C:/Windows/Fonts"),
+    Path("/usr/share/fonts"),
+    Path("/usr/local/share/fonts"),
+    Path.home() / ".fonts",
+]
+for _fdir in _FONT_CANDIDATE_DIRS:
+    if _fdir.is_dir():
+        for _fname in ["simsun.ttc", "simhei.ttf", "msyh.ttc", "msyhl.ttc", "times.ttf", "timesbd.ttf", "NotoSansCJK-Regular.ttc", "wqy-microhei.ttc"]:
+            _fpath = _fdir / _fname
+            if _fpath.exists():
+                try:
+                    fm.fontManager.addfont(str(_fpath))
+                except Exception:
+                    pass
+
+matplotlib.rcParams['font.sans-serif'] = [
+    'SimSun', 'Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei',
+    'Noto Sans CJK SC', 'Droid Sans Fallback', 'DejaVu Sans', 'sans-serif'
+]
+matplotlib.rcParams['font.serif'] = [
+    'Times New Roman', 'SimSun', 'Microsoft YaHei',
+    'Noto Serif CJK SC', 'DejaVu Serif', 'serif'
+]
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['mathtext.fontset'] = 'stix'
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -66,6 +93,7 @@ try:
         generate_ellipsoid_points,
         filter_pose_by_axis_diff,
         check_pick_pose_for_2finger_gripper_range,
+        compute_trimmed_distance,
     )
     from lggpf.shape_fitting import FittingByBGS, ShapeClassifier
     from lggpf.grasp import PickPose
@@ -104,6 +132,7 @@ class PipelineVisualizer:
         self.detection_threshold = pipe_cfg.get("detection_threshold", 0.1)
         self.segmentation_max_points = pipe_cfg.get("segmentation_max_points", 10000)
         self.fitting_synthetic_points = pipe_cfg.get("fitting_synthetic_points", 5000)
+        self.fitting_threshold_exit = pipe_cfg.get("fitting_threshold_exit", 2.0)
 
         grasp_cfg = pipe_cfg.get("grasp", {})
         self.z_axis_filter_threshold = grasp_cfg.get("z_axis_filter_threshold", np.pi / 4)
@@ -216,6 +245,7 @@ class PipelineVisualizer:
                 pass
 
         # --- Stage 1: OWLv2 Detection ---
+        t0_det = time.perf_counter()
         box = list(offline_box)
         det_score = 0.95
         if self.active_mode == "full" and self.vlm is not None and img_rgb is not None:
@@ -229,8 +259,10 @@ class PipelineVisualizer:
                 det_score = float(scores[0].cpu().numpy()) if len(scores) > 0 else 0.95
         data["box"] = box
         data["det_score"] = det_score
+        data["detection_ms"] = (time.perf_counter() - t0_det) * 1000.0
 
         # --- Stage 2: SAM Segmentation ---
+        t0_seg = time.perf_counter()
         mask = None
         if self.active_mode == "full" and self.seg_model is not None and img_rgb is not None and box:
             try:
@@ -270,8 +302,10 @@ class PipelineVisualizer:
             if depth_map is not None:
                 mask = mask & (depth_map > 0)
         data["mask"] = mask
+        data["segmentation_ms"] = (time.perf_counter() - t0_seg) * 1000.0
 
         # --- Stage 3: Point Cloud Unprojection & Normal Estimation ---
+        t0_pcd = time.perf_counter()
         pcd = None
         pcd_p = folder_path / "pcd.ply"
         if pcd_p.exists() and (self.active_mode != "full" or mask is None):
@@ -303,73 +337,169 @@ class PipelineVisualizer:
                 pcd.estimate_normals()
                 pcd.orient_normals_towards_camera_location(self.normal_orientation_location)
         data["pcd"] = pcd
+        data["pointcloud_ms"] = (time.perf_counter() - t0_pcd) * 1000.0
 
         # --- Stage 4: Neural Geometric Shape Classification & Fitting ---
-        pred_cat = self.classifier.predict(pcd) if (self.classifier and pcd and len(pcd.points) > 0) else "0"
-        if pred_cat == "0":
-            type_list = ["0"]
-        elif pred_cat == "1":
-            type_list = ["11", "13"] if not self.legacy_primitives else ["01", "11", "12", "13", "14"]
-        elif pred_cat == "2":
-            type_list = ["2"]
-        else:
-            type_list = ["0"]
-        best_cls = "0"
-        best_params = None
-        best_pcd_fit = None
-        min_dist = float("inf")
+        t0_cls = time.perf_counter()
+        ranked_categories = (
+            self.classifier.predict_ranked(pcd)
+            if (self.classifier and pcd and len(pcd.points) > 0)
+            else [("0", 1.0)]
+        )
+        data["classification_ms"] = (time.perf_counter() - t0_cls) * 1000.0
+        data["ranked_categories"] = [(cat, float(conf)) for cat, conf in ranked_categories]
+        pred_cat = ranked_categories[0][0] if ranked_categories else "0"
+        data["predicted_category"] = pred_cat
 
-        for tp in type_list:
+        t0_fit = time.perf_counter()
+        tau_exit = getattr(self, "fitting_threshold_exit", 2.0)
+
+        best_target = pred_cat
+        best_params = []
+        best_fit_cloud = None
+        best_dist = float("inf")
+        fitting_steps = []
+
+        cat_names = {
+            "0": "cuboid",
+            "01": "cuboid",
+            "1": "cone/frustum",
+            "11": "cone/frustum",
+            "12": "cone/frustum",
+            "13": "cone/frustum",
+            "14": "cone/frustum",
+            "2": "ellipsoid",
+        }
+
+        for rank_idx, (cat_code, conf) in enumerate(ranked_categories):
             try:
-                params = self.fbg.fitting(pcd, tp)
-            except Exception:
-                continue
-            if not params:
+                cand_params = self.fbg.fitting(pcd, cat_code)
+            except Exception as exc:
+                logger.warning("Targeted fitting %s failed: %s", cat_code, exc)
                 continue
 
-            if tp in ("0", "01"):
-                pts = generate_cube_points(np.array(params[:3]) * 2, total_points=self.fitting_synthetic_points)
-            elif tp in ("1", "11", "12", "13", "14"):
-                r1, r2, h, _ = params
-                if r1 <= 1e-4 or r2 <= 1e-4 or h <= 1e-4 or np.isnan(r1) or np.isnan(r2):
-                    continue
-                pts = generate_cone_points(r_bottom=r2, r_top_ratio=r1 / r2, height=h, total_points=self.fitting_synthetic_points)
-            elif tp == "2":
-                pts = generate_ellipsoid_points(*params[:3], total_points=self.fitting_synthetic_points)
+            if not cand_params:
+                continue
+
+            if cat_code in ("0", "01"):
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=self.fitting_synthetic_points
+                )
+            elif cat_code in ("1", "11", "12", "13", "14"):
+                r1, r2, h, _ = cand_params
+                pts = generate_cone_points(
+                    r_bottom=r2,
+                    r_top_ratio=r1 / r2 if r2 > 1e-6 else 1.0,
+                    height=h,
+                    total_points=self.fitting_synthetic_points,
+                )
+            elif cat_code == "2":
+                pts = generate_ellipsoid_points(
+                    *cand_params[:3], total_points=self.fitting_synthetic_points
+                )
             else:
-                continue
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=self.fitting_synthetic_points
+                )
 
-            fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
-            dist_cloud = o3d.geometry.PointCloud(fit_cloud)
-            dist_cloud.transform(params[-1])
+            cand_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+            dist_cloud = o3d.geometry.PointCloud(cand_cloud)
+            dist_cloud.transform(cand_params[-1])
+            cd = compute_trimmed_distance(pcd, dist_cloud, inlier_ratio=0.90)
 
-            d1 = pcd.compute_point_cloud_distance(dist_cloud)
-            d2 = dist_cloud.compute_point_cloud_distance(pcd)
-            dist_score = float(np.mean(d1) + np.mean(d2))
+            step_satisfied = bool(cd <= tau_exit)
+            fitting_steps.append({
+                "rank": rank_idx + 1,
+                "category": cat_code,
+                "category_name": cat_names.get(cat_code, "unknown"),
+                "confidence": round(float(conf), 4),
+                "method": getattr(self.fbg, "last_method", "unknown"),
+                "trimmed_dist_mm": round(float(cd), 4),
+                "early_exit_satisfied": step_satisfied,
+                "threshold_mm": float(tau_exit),
+            })
 
-            if dist_score < min_dist:
-                min_dist = dist_score
-                best_cls = tp
-                best_params = params
-                best_pcd_fit = fit_cloud
+            if cd < best_dist:
+                best_dist = cd
+                best_target = cat_code
+                best_params = cand_params
+                best_fit_cloud = cand_cloud
+
+            if step_satisfied:
+                break
+
+        data["fitting_steps"] = fitting_steps
+        fallback_triggered = False
+
+        if not best_params and best_target != "0":
+            fallback_triggered = True
+            best_target = "0"
+            try:
+                best_params = self.fbg.fitting(pcd, "0")
+                pts = generate_cube_points(
+                    np.array(best_params[:3]) * 2, total_points=self.fitting_synthetic_points
+                )
+                best_fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+                dist_cloud = o3d.geometry.PointCloud(best_fit_cloud)
+                dist_cloud.transform(best_params[-1])
+                best_dist = compute_trimmed_distance(pcd, dist_cloud, inlier_ratio=0.90)
+                fitting_steps.append({
+                    "rank": len(fitting_steps) + 1,
+                    "category": "0",
+                    "category_name": "cuboid",
+                    "confidence": 0.0,
+                    "method": getattr(self.fbg, "last_method", "fallback_cuboid"),
+                    "trimmed_dist_mm": round(float(best_dist), 4),
+                    "early_exit_satisfied": bool(best_dist <= tau_exit),
+                    "threshold_mm": float(tau_exit),
+                })
+            except Exception as exc:
+                logger.error("Fallback cuboid fitting also failed: %s", exc)
+                best_params = []
+
+        data["fallback_triggered"] = fallback_triggered
+        data["fitting_ms"] = (time.perf_counter() - t0_fit) * 1000.0
+
+        if not best_params:
+            raise RuntimeError("Geometric shape fitting failed in visualize_pipeline.")
+
+        target_type = best_target
+        params = best_params
+        fit_cloud = best_fit_cloud
+        dist_score = best_dist
+
+        best_cls = target_type
+        best_pcd_fit = fit_cloud
 
         data["best_cls"] = best_cls
         data["best_params"] = best_params
         data["best_pcd_fit"] = best_pcd_fit
-        data["min_dist"] = min_dist
+        data["min_dist"] = dist_score
+        data["chamfer_distance"] = dist_score
 
-        if best_cls in ("0", "01"):
+        if target_type in ("0", "01"):
             prim_name = "Cuboid"
-        elif best_cls in ("1", "11", "12", "13", "14"):
+        elif target_type in ("1", "11", "12", "13", "14"):
             prim_name = "Frustum Cone"
-        elif best_cls == "2":
+        elif target_type == "2":
             prim_name = "Ellipsoid"
         else:
             prim_name = "Unknown"
         data["primitive_type_name"] = prim_name
 
+        data["final_category"] = target_type
+        data["final_category_name"] = prim_name
+        data["final_trimmed_dist_mm"] = round(float(dist_score), 4)
+        data["early_exit_triggered"] = bool(any(s["early_exit_satisfied"] for s in fitting_steps))
+        data["fitted_dimensions"] = [round(float(x * 2), 2) for x in best_params[:3]]
+        t_mat = best_params[-1].t if hasattr(best_params[-1], "t") else np.asarray(best_params[-1])[:3, 3]
+        data["fitted_translation"] = [round(float(x), 2) for x in np.asarray(t_mat).flatten()[:3]]
+        data["best_method"] = getattr(self.fbg, "last_method", "unknown")
+
         # --- Stage 5: Grasp Manifold Generation & Gripper Filtering ---
+        t0_grasp = time.perf_counter()
         candidate_poses = []
+        downward_poses = []
         filtered_poses = []
         if best_params is not None:
             t_OC = best_params[-1]
@@ -382,11 +512,25 @@ class PipelineVisualizer:
                     else PickPose.gen_cube_end_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth)
             elif best_cls in ("1", "11", "12", "13", "14"):
                 if is_center:
-                    ppose = PickPose.gen_cone_center_pick_poses(best_params[2], self.cone_num_positions, gripper_depth=self.gripper_depth_center)
+                    ppose = PickPose.gen_cone_center_pick_poses(
+                        best_params[2],
+                        self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_center,
+                    )
                 elif is_side:
-                    ppose = PickPose.gen_cone_side_pick_poses(best_params[2], best_params[0], best_params[1], num_each_side=self.cone_num_positions, gripper_depth=self.gripper_depth_side)
+                    ppose = PickPose.gen_cone_side_pick_poses(
+                        best_params[2],
+                        best_params[0],
+                        best_params[1],
+                        num_each_side=self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_side,
+                    )
                 else:
-                    ppose = PickPose.gen_cone_end_pick_poses(best_params[2], self.cone_num_positions, gripper_depth=self.gripper_depth_end)
+                    ppose = PickPose.gen_cone_end_pick_poses(
+                        best_params[2],
+                        self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_end,
+                    )
             elif best_cls == "2":
                 ppose = PickPose.gen_ellipsoid_center_pick_poses(self.ellipsoid_num_directions)
             else:
@@ -399,30 +543,45 @@ class PipelineVisualizer:
                     ppose[i] = self.T_BC_Cali * t_OC * p
 
             candidate_poses = list(ppose)
-            ppose = filter_pose_by_axis_diff(ppose, axis=2, ref_axis=[0, 0, -1], t=self.z_axis_filter_threshold, sorted=True)
+            ppose = filter_pose_by_axis_diff(
+                ppose, axis=2, ref_axis=[0, 0, -1], t=self.z_axis_filter_threshold, sorted=True
+            )
+            downward_poses = list(ppose)
 
             if not is_side and best_pcd_fit is not None:
                 pcd_model = o3d.geometry.PointCloud(best_pcd_fit)
                 pcd_model.transform(self.T_BC_Cali * t_OC)
-                ppose = check_pick_pose_for_2finger_gripper_range(pcd_model, ppose, self.finger_range)
+                filtered = check_pick_pose_for_2finger_gripper_range(
+                    pcd_model, ppose, self.finger_range
+                )
+                if len(filtered) == 0 and len(downward_poses) > 0:
+                    logger.warning(
+                        "All poses rejected by gripper aperture check; falling back to %d downward poses.",
+                        len(downward_poses),
+                    )
+                    ppose = downward_poses
+                else:
+                    ppose = filtered
+            elif len(ppose) == 0 and len(downward_poses) > 0:
+                ppose = downward_poses
 
             filtered_poses = ppose
 
-        # Fallback to saved poses.npy if empty
-        poses_p = folder_path / "poses.npy"
-        if not filtered_poses and poses_p.exists():
-            try:
-                saved = np.load(str(poses_p), allow_pickle=True)
-                filtered_poses = [SE3(p, check=False) if not isinstance(p, SE3) else p for p in saved]
-                candidate_poses = list(filtered_poses)
-            except Exception:
-                pass
-
         data["candidate_poses"] = candidate_poses
         data["filtered_poses"] = filtered_poses
-        data["best_pose"] = filtered_poses[0] if len(filtered_poses) > 0 else (candidate_poses[0] if len(candidate_poses) > 0 else None)
+        data["best_pose"] = (
+            filtered_poses[0]
+            if len(filtered_poses) > 0
+            else (downward_poses[0] if len(downward_poses) > 0 else None)
+        )
+        data["candidate_poses_count"] = len(candidate_poses)
+        data["downward_poses_count"] = len(downward_poses)
+        data["filtered_poses_count"] = len(filtered_poses)
+        data["has_best_pose"] = data["best_pose"] is not None
+        data["grasp_ms"] = (time.perf_counter() - t0_grasp) * 1000.0
 
         # --- Stage 6: Quintic Polynomial Trajectory Planning ---
+        t0_traj = time.perf_counter()
         q_start = np.array(self.cfg.get("robot", {}).get("start_pose", [0, 0, np.pi / 2, 0, np.pi / 2, 0]), dtype=np.float64)
         q_goal = q_start + np.array([0.25, -0.30, 0.45, -0.15, 0.20, -0.10])
         t_traj, q_traj, qd_traj, qdd_traj = self._solve_quintic(q_start, q_goal, self.num_path_joints, self.path_time)
@@ -430,6 +589,7 @@ class PipelineVisualizer:
         data["q_traj"] = q_traj
         data["qd_traj"] = qd_traj
         data["qdd_traj"] = qdd_traj
+        data["trajectory_ms"] = (time.perf_counter() - t0_traj) * 1000.0
 
         return data
 
@@ -702,7 +862,7 @@ class PipelineVisualizer:
             ax3.grid(True, linestyle=":", alpha=0.5)
 
         # ---------------------------------------------------------------------
-        # Subplot 4: (d) 几何基元竞争拟合 (Primitive Manifold Fitting)
+        # Subplot 4: (d) 几何基元拟合 (Neural Primitive Manifold Fitting)
         # ---------------------------------------------------------------------
         ax4 = fig.add_axes([x_col0, row1_bottom, w_col, row1_height], projection="3d")
         best_cls = data.get("best_cls", "0")
@@ -710,14 +870,21 @@ class PipelineVisualizer:
         chamfer_err = data.get("min_dist", 0.0)
         prim_name_cn = "圆锥台" if best_cls in ("1", "11", "12", "13", "14") else ("长方体" if best_cls in ("0", "01") else "椭球体")
 
+        # Transform point cloud to Robot Base Frame (B) to ensure 100% visual consistency with (e) and (f)
+        T_BC_mat = self.T_BC_Cali.A if isinstance(self.T_BC_Cali, SE3) else np.asarray(self.T_BC_Cali, dtype=np.float64)
+        pcd_b = None
         if pcd is not None and len(pcd.points) > 0:
-            pts = np.asarray(pcd.points)
-            step = max(1, len(pts) // 800)
-            ax4.scatter(pts[::step, 0], pts[::step, 1], pts[::step, 2],
+            pcd_b = o3d.geometry.PointCloud(pcd)
+            pcd_b.transform(T_BC_mat)
+            pts_b = np.asarray(pcd_b.points)
+            step = max(1, len(pts_b) // 800)
+            ax4.scatter(pts_b[::step, 0], pts_b[::step, 1], pts_b[::step, 2],
                         c="#78909C", s=1.0, alpha=0.30, depthshade=True)
 
         if best_params is not None:
-            t_mat = best_params[-1].A if isinstance(best_params[-1], SE3) else best_params[-1]
+            # Transform primitive pose from Camera Frame (C) to Robot Base Frame (B): T_OB = T_BC @ T_OC
+            t_mat_c = best_params[-1].A if isinstance(best_params[-1], SE3) else np.asarray(best_params[-1], dtype=np.float64)
+            t_mat = T_BC_mat @ t_mat_c
             origin = t_mat[:3, 3]
 
             if best_cls in ("0", "01"):
@@ -746,10 +913,10 @@ class PipelineVisualizer:
             ax4.quiver(origin[0], origin[1], origin[2], t_mat[0, 2], t_mat[1, 2], t_mat[2, 2],
                        length=frame_len, color="#2962FF", linewidth=1.8, arrow_length_ratio=0.3)
 
-            ax4.set_xlabel(r"$X_C$ (mm)", fontsize=8.5, labelpad=-1.5)
-            ax4.set_ylabel(r"$Y_C$ (mm)", fontsize=8.5, labelpad=-1.5)
-            ax4.set_zlabel(r"$Z_C$ (mm)", fontsize=8.5, labelpad=-1.0)
-            ax4.view_init(elev=22, azim=-55)
+            ax4.set_xlabel(r"$X_B$ (mm)", fontsize=8.5, labelpad=-1.5)
+            ax4.set_ylabel(r"$Y_B$ (mm)", fontsize=8.5, labelpad=-1.5)
+            ax4.set_zlabel(r"$Z_B$ (mm)", fontsize=8.5, labelpad=-1.0)
+            ax4.view_init(elev=22, azim=-72)
             ax4.tick_params(labelsize=7.0, pad=0.1)
             ax4.grid(True, linestyle=":", alpha=0.5)
 
@@ -760,10 +927,10 @@ class PipelineVisualizer:
         candidate_poses = data.get("candidate_poses", [])
         best_pose = data.get("best_pose")
 
-        pcd_b = None
-        if pcd is not None and len(pcd.points) > 0:
+        if pcd_b is None and pcd is not None and len(pcd.points) > 0:
             pcd_b = o3d.geometry.PointCloud(pcd)
-            pcd_b.transform(self.T_BC_Cali)
+            pcd_b.transform(T_BC_mat)
+        if pcd_b is not None and len(pcd_b.points) > 0:
             pts_b = np.asarray(pcd_b.points)
             step = max(1, len(pts_b) // 800)
             ax5.scatter(pts_b[::step, 0], pts_b[::step, 1], pts_b[::step, 2],
@@ -827,8 +994,8 @@ class PipelineVisualizer:
             p_home = np.array([-100.0, -180.0, 460.0])
 
             # Workpiece point cloud: solid black, delicate, distinct silhouette (halved size)
-            if pcd_b is not None:
-                pts_b = np.asarray(pcd_b.points)
+            pts_b = np.asarray(pcd_b.points) if (pcd_b is not None and len(pcd_b.points) > 0) else None
+            if pts_b is not None:
                 step = max(1, len(pts_b) // 350)
                 ax6.scatter(pts_b[::step, 0], pts_b[::step, 1], pts_b[::step, 2],
                             c="black", s=0.35, alpha=0.30, depthshade=True, label="工件点云")
@@ -906,8 +1073,8 @@ class PipelineVisualizer:
             ax6.set_ylabel(r"$Y_B$ (mm)", fontsize=8.5, labelpad=-1.5)
             ax6.set_zlabel(r"$Z_B$ (mm)", fontsize=8.5, labelpad=-1.0)
             
-            # SIDE VIEW PERSPECTIVE: elev=18, azim=-115 (Profile view perpendicular to motion arc)
-            ax6.view_init(elev=18, azim=-115)
+            # UNIFIED PERSPECTIVE: elev=22, azim=-72 (Identical viewpoint to Subplots d and e)
+            ax6.view_init(elev=22, azim=-72)
             ax6.tick_params(labelsize=7.0, pad=0.1)
             ax6.grid(True, linestyle=":", alpha=0.5)
 
@@ -939,6 +1106,101 @@ class PipelineVisualizer:
                 ax_inset.set_ylabel(r"$q_i$ (rad)", fontsize=5.8, labelpad=0.2)
                 ax_inset.tick_params(labelsize=5.5, pad=0.2)
                 ax_inset.grid(True, linestyle=":", alpha=0.6)
+        else:
+            # -----------------------------------------------------------------
+            # Fallback for No Feasible Grasp: Render All Candidate Poses & Workpiece
+            # -----------------------------------------------------------------
+            pts_b = np.asarray(pcd_b.points) if (pcd_b is not None and len(pcd_b.points) > 0) else None
+            if pts_b is not None:
+                step = max(1, len(pts_b) // 500)
+                ax6.scatter(pts_b[::step, 0], pts_b[::step, 1], pts_b[::step, 2],
+                            c="black", s=0.45, alpha=0.35, depthshade=True, label="工件点云")
+
+            # Wireframe of the geometric primitive (cuboid / cone / ellipsoid)
+            if best_params is not None:
+                t_mat_c = best_params[-1].A if isinstance(best_params[-1], SE3) else np.asarray(best_params[-1], dtype=np.float64)
+                t_mat = T_BC_mat @ t_mat_c
+                if best_cls in ("0", "01"):
+                    size = np.array(best_params[:3]) * 2.0
+                    corners, edges = self._create_cuboid_wireframe(size, t_mat)
+                    for e in edges:
+                        p1, p2 = corners[e[0]], corners[e[1]]
+                        ax6.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color="#1E88E5", linewidth=1.1, alpha=0.45)
+                elif best_cls in ("1", "11", "12", "13", "14"):
+                    r1, r2, h, _ = best_params
+                    rings, meridians = self._create_cone_wireframe(r1, r2, h, t_mat)
+                    for ring in rings:
+                        ax6.plot(ring[:, 0], ring[:, 1], ring[:, 2], color="#00C853", linewidth=1.0, alpha=0.45)
+                    for p_bot, p_top in meridians:
+                        ax6.plot([p_bot[0], p_top[0]], [p_bot[1], p_top[1]], [p_bot[2], p_top[2]], color="#00C853", linewidth=1.1, alpha=0.45)
+                elif best_cls == "2":
+                    ell_rings = self._create_ellipsoid_wireframe(np.array(best_params[:3]), t_mat)
+                    for ring in ell_rings:
+                        ax6.plot(ring[:, 0], ring[:, 1], ring[:, 2], color="#AA00FF", linewidth=1.0, alpha=0.45)
+
+            # Traverse all candidate poses: draw gripper wireframe and approach vector arrows
+            pose_centers = []
+            for pose in candidate_poses:
+                t_mat_p = pose.A if isinstance(pose, SE3) else pose
+                t_pos = t_mat_p[:3, 3]
+                z_vec = t_mat_p[:3, 2]
+                pose_centers.append(t_pos)
+
+                lines_g, pads_g, _ = self._create_gripper_wireframe(
+                    pose, aperture=self.finger_range, finger_len=24.0, finger_thick=3.5
+                )
+                for p1, p2 in lines_g:
+                    ax6.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                             color="#FF6D00", linewidth=0.75, alpha=0.45)
+                pad_l, pad_r = pads_g
+                ax6.scatter([pad_l[0], pad_r[0]], [pad_l[1], pad_r[1]], [pad_l[2], pad_r[2]],
+                            color="#FFD600", s=10, edgecolors="#E65100", linewidth=0.5, alpha=0.6, zorder=8)
+
+                ax6.quiver(t_pos[0], t_pos[1], t_pos[2], z_vec[0], z_vec[1], z_vec[2],
+                           length=18.0, color="#00BCD4", linewidth=1.1, alpha=0.7, arrow_length_ratio=0.35)
+
+            # Adaptive coordinate limits bounding workpiece point cloud and all candidate pose centers
+            all_pts_list = []
+            if pts_b is not None and len(pts_b) > 0:
+                all_pts_list.append(pts_b)
+            if pose_centers:
+                all_pts_list.append(np.array(pose_centers))
+
+            if all_pts_list:
+                all_combined = np.vstack(all_pts_list)
+                c_min = all_combined.min(axis=0)
+                c_max = all_combined.max(axis=0)
+                margin = 25.0
+                ax6.set_xlim([c_min[0] - margin, c_max[0] + margin])
+                ax6.set_ylim([c_min[1] - margin, c_max[1] + margin])
+                ax6.set_zlim([c_min[2] - margin, c_max[2] + margin])
+            else:
+                ax6.set_xlim([-460, 0])
+                ax6.set_ylim([-210, 100])
+                ax6.set_zlim([-30, 500])
+
+            ax6.set_xlabel(r"$X_B$ (mm)", fontsize=8.5, labelpad=-1.5)
+            ax6.set_ylabel(r"$Y_B$ (mm)", fontsize=8.5, labelpad=-1.5)
+            ax6.set_zlabel(r"$Z_B$ (mm)", fontsize=8.5, labelpad=-1.0)
+            ax6.view_init(elev=22, azim=-72)
+            ax6.tick_params(labelsize=7.0, pad=0.1)
+            ax6.grid(True, linestyle=":", alpha=0.5)
+
+            # Status badge indicating filtering outcome
+            ax6.text2D(0.03, 0.94, "筛选无可行位姿 (展示全量候选分布)",
+                       transform=ax6.transAxes, fontsize=6.5, color="#D32F2F", weight="bold",
+                       bbox=dict(boxstyle="round,pad=0.2", facecolor="#FFEBEE", edgecolor="#EF5350", alpha=0.85))
+
+            # Custom Legend
+            legend_elements = [
+                Line2D([0], [0], marker="o", color="w", label="工件点云",
+                       markerfacecolor="black", markeredgecolor="black", markersize=3.5),
+                Line2D([0], [0], color="#00BCD4", linewidth=1.1, label=r"候选逼近矢量 $Z$"),
+                Line2D([0], [0], color="#FF6D00", linewidth=1.0, label=f"候选夹爪位姿 ({len(candidate_poses)})"),
+            ]
+            ax6.legend(handles=legend_elements, loc="upper left", bbox_to_anchor=(0.01, 0.88),
+                       fontsize=5.5, ncol=1, handlelength=1.0, handletextpad=0.25,
+                       labelspacing=0.18, borderpad=0.20, framealpha=0.85, facecolor="white", edgecolor="#CFD8DC")
 
         # ---------------------------------------------------------------------
         # Unified Figure-Level Title Placement (Strictly aligned horizontally & vertically)
@@ -950,7 +1212,7 @@ class PipelineVisualizer:
 
         title_d = f"(d) 基元拟合：{prim_name_cn}"
         title_e = "(e) 候选抓取位姿与夹爪"
-        title_f = r"(f) 五次多项式 $C^2$ 平滑轨迹"
+        title_f = r"(f) 五次多项式 $C^2$ 平滑轨迹" if best_pose is not None else "(f) 全量候选抓取位姿分布"
 
         fig.text(x_col0, title_y_row1, title_d, ha="left", va="bottom", fontsize=title_fs, fontweight="bold")
         fig.text(x_col1, title_y_row1, title_e, ha="left", va="bottom", fontsize=title_fs, fontweight="bold")
@@ -1051,6 +1313,261 @@ class PipelineVisualizer:
 
 
 # =============================================================================
+# Diagnostic Trace & Reporting Suite
+# =============================================================================
+
+def build_session_diagnostic(
+    data: dict[str, Any],
+    rel_name: str,
+    out_img_path: Path,
+    out_diag_path: Path,
+) -> dict[str, Any]:
+    """Construct a clean, serializable diagnostic report for an experimental session."""
+    det_ms = round(float(data.get("detection_ms", 0.0)), 2)
+    seg_ms = round(float(data.get("segmentation_ms", 0.0)), 2)
+    pcd_ms = round(float(data.get("pointcloud_ms", 0.0)), 2)
+    cls_ms = round(float(data.get("classification_ms", 0.0)), 2)
+    fit_ms = round(float(data.get("fitting_ms", 0.0)), 2)
+    grp_ms = round(float(data.get("grasp_ms", 0.0)), 2)
+    trj_ms = round(float(data.get("trajectory_ms", 0.0)), 2)
+    core_ms = round(pcd_ms + cls_ms + fit_ms + grp_ms + trj_ms, 2)
+    total_ms = round(det_ms + seg_ms + core_ms, 2)
+
+    pcd = data.get("pcd")
+    pcd_count = len(pcd.points) if pcd is not None and hasattr(pcd, "points") else 0
+
+    ranked_categories = [
+        {"category": str(cat), "confidence": round(float(conf), 4)}
+        for cat, conf in data.get("ranked_categories", [])
+    ]
+
+    diag = {
+        "session_id": str(data.get("session_id", rel_name)),
+        "rel_name": rel_name,
+        "input": {
+            "instruction": data.get("instruction", ""),
+            "folder_path": str(data.get("folder_path", "")),
+        },
+        "perception": {
+            "bounding_box": data.get("box", []),
+            "detection_confidence": round(float(data.get("det_score", 0.0)), 4),
+            "pointcloud_points": pcd_count,
+        },
+        "neural_classification": {
+            "predicted_category": data.get("predicted_category", ""),
+            "ranked_categories": ranked_categories,
+        },
+        "geometric_fitting": {
+            "fitting_steps": data.get("fitting_steps", []),
+            "early_exit_triggered": bool(data.get("early_exit_triggered", False)),
+            "fallback_triggered": bool(data.get("fallback_triggered", False)),
+            "final_category": data.get("final_category", ""),
+            "final_category_name": data.get("final_category_name", ""),
+            "best_method": data.get("best_method", ""),
+            "trimmed_dist_mm": data.get("final_trimmed_dist_mm", 0.0),
+            "fitted_dimensions": data.get("fitted_dimensions", []),
+            "fitted_translation": data.get("fitted_translation", []),
+        },
+        "grasp_planning": {
+            "candidate_poses_count": int(data.get("candidate_poses_count", 0)),
+            "downward_poses_count": int(data.get("downward_poses_count", 0)),
+            "filtered_poses_count": int(data.get("filtered_poses_count", 0)),
+            "has_best_pose": bool(data.get("has_best_pose", False)),
+        },
+        "latencies_ms": {
+            "stage1_detection": det_ms,
+            "stage2_segmentation": seg_ms,
+            "stage3_pointcloud": pcd_ms,
+            "stage4_classification": cls_ms,
+            "stage5_fitting": fit_ms,
+            "stage6_grasp": grp_ms,
+            "stage7_trajectory": trj_ms,
+            "core_pipeline_total": core_ms,
+            "end_to_end_total": total_ms,
+        },
+        "artifacts": {
+            "composite_vis_png": str(out_img_path),
+            "diagnostic_json": str(out_diag_path),
+        },
+    }
+    return diag
+
+
+def _display_width(s: str) -> int:
+    """Compute terminal display width accounting for East Asian full-width characters."""
+    w = 0
+    for ch in s:
+        if unicodedata.east_asian_width(ch) in ("F", "W"):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _box_row(text: str, total_width: int = 76) -> str:
+    """Format a single row enclosed in unicode box vertical borders."""
+    inner = total_width - 4
+    curr_w = _display_width(text)
+    if curr_w > inner:
+        res = ""
+        acc = 0
+        for ch in text:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+            if acc + cw > inner - 3:
+                res += "..."
+                acc += 3
+                break
+            res += ch
+            acc += cw
+        padding = inner - acc
+        return f"│ {res}{' ' * padding} │"
+    else:
+        padding = inner - curr_w
+        return f"│ {text}{' ' * padding} │"
+
+
+def _compact_path(p_str: str) -> str:
+    """Return compact relative path if inside repository, otherwise filename."""
+    if not p_str:
+        return ""
+    try:
+        p = Path(p_str)
+        try:
+            return str(p.relative_to(SCRIPT_DIR)).replace("\\", "/")
+        except ValueError:
+            return p.name
+    except Exception:
+        return p_str
+
+
+def print_diagnostic_card(diag: dict[str, Any]):
+    """Print a standardized 76-character wide ASCII diagnostic card in the console."""
+    w = 76
+    top_border = f"┌{'─' * (w - 2)}┐"
+    mid_border = f"├{'─' * (w - 2)}┤"
+    bot_border = f"└{'─' * (w - 2)}┘"
+
+    lines = [
+        "",
+        top_border,
+        _box_row("LGGPF SESSION DIAGNOSTIC REPORT".center(w - 4)),
+        mid_border,
+    ]
+
+    # Section 1: Session & Perception
+    sess_id = diag.get("session_id", "N/A")
+    inst = diag.get("input", {}).get("instruction", "N/A")
+    bbox = diag.get("perception", {}).get("bounding_box", [])
+    det_conf = diag.get("perception", {}).get("detection_confidence", 0.0)
+    pcd_pts = diag.get("perception", {}).get("pointcloud_points", 0)
+
+    lines.append(_box_row(f"Session ID   : {sess_id}"))
+    lines.append(_box_row(f"Instruction  : {inst}"))
+    lines.append(_box_row(f"Bounding Box : {bbox} (Det Conf: {det_conf:.4f})"))
+    lines.append(_box_row(f"Point Cloud  : {pcd_pts} surface points"))
+    lines.append(mid_border)
+
+    # Section 2: Neural Classification
+    lines.append(_box_row("Stage 4: Neural Category Hypothesis Ranking (Mamba3D / PointNet2)"))
+    pred_cat = diag.get("neural_classification", {}).get("predicted_category", "")
+    cat_lookup = {
+        "0": "cuboid",
+        "01": "cuboid",
+        "1": "cone/frustum",
+        "11": "cone/frustum",
+        "12": "cone/frustum",
+        "13": "cone/frustum",
+        "14": "cone/frustum",
+        "2": "ellipsoid",
+    }
+    ranked = diag.get("neural_classification", {}).get("ranked_categories", [])
+    if ranked:
+        for idx, item in enumerate(ranked, 1):
+            c_code = str(item.get("category", ""))
+            c_conf = float(item.get("confidence", 0.0))
+            c_name = cat_lookup.get(c_code, "unknown")
+            is_pred = " [PREDICTED]" if c_code == pred_cat and idx == 1 else ""
+            lines.append(_box_row(f"  Rank {idx}: Cat {c_code} ({c_name:<12})  Conf: {c_conf:.4f}{is_pred}"))
+    else:
+        lines.append(_box_row("  No ranking available (single fallback hypothesis)"))
+    lines.append(mid_border)
+
+    # Section 3: Sequential Shape Fitting & Verification Trace
+    lines.append(_box_row("Stage 5: Sequential Shape Fitting & Verification Trace"))
+    steps = diag.get("geometric_fitting", {}).get("fitting_steps", [])
+    if steps:
+        for st in steps:
+            r = st.get("rank", 1)
+            c = st.get("category", "")
+            c_nm = st.get("category_name", "")
+            cd_val = st.get("trimmed_dist_mm", 0.0)
+            th_val = st.get("threshold_mm", 2.0)
+            sat = st.get("early_exit_satisfied", False)
+            status_str = "EXIT TRIGGERED (<= th)" if sat else "REJECTED (> th)"
+            lines.append(_box_row(f"  #{r} [Cat {c}] {c_nm:<12} | dist: {cd_val:5.2f} mm | th: {th_val:.1f} mm -> {status_str}"))
+    else:
+        lines.append(_box_row("  Single-shot fitting executed without sequential trace"))
+
+    geom = diag.get("geometric_fitting", {})
+    fn_name = geom.get("final_category_name", "unknown")
+    fn_cat = geom.get("final_category", "")
+    method = geom.get("best_method", "unknown")
+    t_dist = geom.get("trimmed_dist_mm", 0.0)
+    ee_trig = geom.get("early_exit_triggered", False)
+    fb_trig = geom.get("fallback_triggered", False)
+    dims = geom.get("fitted_dimensions", [])
+    trans = geom.get("fitted_translation", [])
+
+    lines.append(_box_row(f"Final Primitive : {fn_name} (Cat {fn_cat}) via {method}"))
+    lines.append(_box_row(f"Trimmed Error   : {t_dist:.4f} mm (Early Exit: {ee_trig}, Fallback: {fb_trig})"))
+    lines.append(_box_row(f"Fitted Geometry : Dims {dims} mm, Trans {trans} mm"))
+    lines.append(mid_border)
+
+    # Section 4: Grasp Planning
+    lines.append(_box_row("Stage 6 & 7: Grasp Manifold Filtering Funnel & Trajectory Planning"))
+    g_info = diag.get("grasp_planning", {})
+    cand_cnt = g_info.get("candidate_poses_count", 0)
+    down_cnt = g_info.get("downward_poses_count", 0)
+    filt_cnt = g_info.get("filtered_poses_count", 0)
+    has_best = g_info.get("has_best_pose", False)
+    lines.append(_box_row(f"Candidates Gen  : {cand_cnt} poses -> Downward Filtered: {down_cnt} poses"))
+    lines.append(_box_row(f"Aperture Feasible: {filt_cnt} poses (Best Pose Selected: {has_best})"))
+    lines.append(_box_row("Trajectory Plan : Quintic 6-DoF Joint Interpolation (T=3.0s, 200 pts)"))
+    lines.append(mid_border)
+
+    # Section 5: Latency Breakdown
+    lats = diag.get("latencies_ms", {})
+    d_ms = lats.get("stage1_detection", 0.0)
+    s_ms = lats.get("stage2_segmentation", 0.0)
+    p_ms = lats.get("stage3_pointcloud", 0.0)
+    c_ms = lats.get("stage4_classification", 0.0)
+    f_ms = lats.get("stage5_fitting", 0.0)
+    g_ms = lats.get("stage6_grasp", 0.0)
+    t_ms = lats.get("stage7_trajectory", 0.0)
+    core_ms = lats.get("core_pipeline_total", 0.0)
+    e2e_ms = lats.get("end_to_end_total", 0.0)
+
+    lines.append(_box_row("Latency Breakdown (ms)"))
+    lines.append(_box_row(f"  Perception    : Det: {d_ms:6.1f} ms | Seg: {s_ms:6.1f} ms | PCD: {p_ms:6.1f} ms"))
+    lines.append(_box_row(f"  Core Planning : Cls: {c_ms:6.1f} ms | Fit: {f_ms:6.1f} ms | Grp: {g_ms:6.1f} ms | Trj: {t_ms:4.1f} ms"))
+    lines.append(_box_row(f"  Pipeline Total: Core: {core_ms:6.1f} ms | End-to-End: {e2e_ms:6.1f} ms"))
+    lines.append(mid_border)
+
+    # Section 6: Output Artifacts
+    arts = diag.get("artifacts", {})
+    img_art = _compact_path(arts.get("composite_vis_png", ""))
+    json_art = _compact_path(arts.get("diagnostic_json", ""))
+    lines.append(_box_row("Output Artifacts:"))
+    lines.append(_box_row(f"  Figure : {img_art}"))
+    lines.append(_box_row(f"  Diag   : {json_art}"))
+    lines.append(bot_border)
+    lines.append("")
+
+    card_str = "\n".join(lines)
+    print(card_str)
+
+
+# =============================================================================
 # CLI Main Entry Point
 # =============================================================================
 
@@ -1058,6 +1575,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LGGPF 6-Stage Pipeline Visualization Suite")
     parser.add_argument("--session", type=str, default=None,
                         help="Specific session ID to visualize (e.g., 'single/16-23-49' or 'single/16-49-28')")
+    parser.add_argument("--session-index", type=int, default=None,
+                        help="0-based index of the session within the specified subset(s) to visualize")
     parser.add_argument("--all", action="store_true",
                         help="Process all available experimental sessions in data/success")
     parser.add_argument("--subsets", nargs="+", default=["single"],
@@ -1125,6 +1644,18 @@ def main():
             else:
                 sys.exit(f"[ERROR] Specified session not found: {args.session} (checked {target})")
         target_paths.append(target)
+    elif args.session_index is not None:
+        all_candidates = []
+        for sub in args.subsets:
+            s_dir = args.data_dir / sub
+            if s_dir.exists():
+                for entry in sorted(s_dir.iterdir()):
+                    if entry.is_dir() and entry.name != "videos":
+                        all_candidates.append(entry)
+        if 0 <= args.session_index < len(all_candidates):
+            target_paths.append(all_candidates[args.session_index])
+        else:
+            sys.exit(f"[ERROR] Session index {args.session_index} out of range (found {len(all_candidates)} sessions in {args.subsets}).")
     elif args.all:
         for sub in args.subsets:
             s_dir = args.data_dir / sub
@@ -1160,6 +1691,14 @@ def main():
         vis.render_composite_figure(pipeline_data, out_img_path, dpi=args.dpi,
                                     fig_width=args.width, fig_height=args.height,
                                     show_joint_inset=args.show_joint_inset)
+
+        out_diag_path = out_img_path.parent / f"{rel_name}_diag.json"
+        diag_data = build_session_diagnostic(pipeline_data, rel_name, out_img_path, out_diag_path)
+        with open(out_diag_path, "w", encoding="utf-8") as f:
+            json.dump(diag_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved diagnostic report to: {out_diag_path}")
+
+        print_diagnostic_card(diag_data)
 
         if args.interactive:
             vis.render_interactive_3d(pipeline_data)

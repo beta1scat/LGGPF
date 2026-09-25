@@ -6,13 +6,13 @@ Primitive Fitting (LGGPF) pipeline on saved experimental sessions in `data/succe
   2. SAM prompted instance segmentation
   3. Depth back-projection and point cloud processing / normal estimation
   4. Mamba3D / PointNet2 geometric shape classification
-  5. Shape primitive targeted fitting / competitive Chamfer distance selection
+  5. Single-shot geometric primitive fitting directly guided by neural prediction
   6. Candidate grasp manifold generation & 6-level physical filtering
   7. Quintic polynomial trajectory planning & collision detection
   8. End-to-end total pipeline latency
 
 Supports:
-  - Classification backends: 'mamba3d' (default), 'pointnet2', 'none' (Chamfer competitive baseline).
+  - Classification backends: 'mamba3d' (default), 'pointnet2'.
   - Dual execution modes:
       * 'full': Runs end-to-end neural network + geometry + planning pipeline.
       * 'geometry': Runs point cloud unprojection, shape classification/fitting, grasp filtering,
@@ -26,7 +26,7 @@ Supports:
 Usage:
   python benchmark_latency.py --mode auto --classifier mamba3d --subsets single
   python benchmark_latency.py --mode geometry --classifier pointnet2 --subsets single multi position
-  python benchmark_latency.py --mode full --classifier none --data-dir data/success/single
+  python benchmark_latency.py --mode full --classifier mamba3d --data-dir data/success/single
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ try:
         generate_ellipsoid_points,
         filter_pose_by_axis_diff,
         check_pick_pose_for_2finger_gripper_range,
+        compute_trimmed_distance,
     )
     from lggpf.shape_fitting import FittingByBGS, ShapeClassifier
     from lggpf.grasp import PickPose
@@ -128,6 +129,7 @@ class TimingRecord:
     grasp_ms: float = 0.0
     trajectory_ms: float = 0.0
     total_pipeline_ms: float = 0.0
+    chamfer_distance: float = 0.0
 
 
 # =============================================================================
@@ -218,6 +220,7 @@ class LatencyBenchmarkRunner:
         self.detection_threshold = pipe_cfg.get("detection_threshold", 0.1)
         self.segmentation_max_points = pipe_cfg.get("segmentation_max_points", 10000)
         self.fitting_synthetic_points = pipe_cfg.get("fitting_synthetic_points", 5000)
+        self.fitting_threshold_exit = pipe_cfg.get("fitting_threshold_exit", 2.0)
 
         grasp_cfg = pipe_cfg.get("grasp", {})
         self.z_axis_filter_threshold = grasp_cfg.get("z_axis_filter_threshold", np.pi / 4)
@@ -297,28 +300,37 @@ class LatencyBenchmarkRunner:
                 logger.info("Auto-detected: Running 'geometry & planning' benchmark using offline inputs.")
                 self.active_mode = "geometry"
 
-        # Initialize geometric classifier (Mamba3D / PointNet2 / none)
-        self.classifier = None
-        if self.classifier_type != "none":
-            ckpt = str(self.classifier_checkpoint) if self.classifier_checkpoint else None
-            try:
-                self.classifier = ShapeClassifier(
-                    model_type=self.classifier_type,
-                    checkpoint_path=ckpt,
-                    normal_orientation=self.normal_orientation_location,
-                )
-                logger.info(
-                    "Initialized geometric classifier: %s (requested: %s).",
-                    self.classifier.model_type,
-                    self.classifier_type,
-                )
-            except Exception as ex:
+        # Initialize geometric classifier (Mamba3D / PointNet2)
+        ckpt = str(self.classifier_checkpoint) if self.classifier_checkpoint else None
+        try:
+            self.classifier = ShapeClassifier(
+                model_type=self.classifier_type,
+                checkpoint_path=ckpt,
+                normal_orientation=self.normal_orientation_location,
+            )
+            logger.info(
+                "Initialized geometric classifier: %s (requested: %s).",
+                self.classifier.model_type,
+                self.classifier_type,
+            )
+        except Exception as ex:
+            if self.classifier_type != "pointnet2":
                 logger.warning(
-                    "Could not initialize %s classifier (%s); defaulting to Chamfer competition without classifier.",
+                    "Could not initialize %s classifier (%s); falling back to PointNet2 baseline.",
                     self.classifier_type,
                     ex,
                 )
-                self.classifier = None
+                try:
+                    self.classifier = ShapeClassifier(
+                        model_type="pointnet2",
+                        checkpoint_path=None,
+                        normal_orientation=self.normal_orientation_location,
+                    )
+                    self.classifier_type = "pointnet2"
+                except Exception as ex_pn:
+                    raise RuntimeError(f"Failed to initialize geometric classifier: {ex_pn}") from ex_pn
+            else:
+                raise RuntimeError(f"Failed to initialize {self.classifier_type} classifier: {ex}") from ex
 
         # Initialize Pinocchio & JointSpacePlanner if available
         if _HAS_PINOCCHIO:
@@ -414,84 +426,125 @@ class LatencyBenchmarkRunner:
         rec.pointcloud_ms = (time.perf_counter() - t0) * 1000.0
 
         # --- Stage 4: Geometric Shape Classification ---
-        pred_cat = None
-        if self.classifier is not None and self.classifier_type != "none" and pcd is not None and len(pcd.points) > 0:
-            cuda_sync()
-            t0 = time.perf_counter()
-            pred_cat = self.classifier.predict(pcd)
-            cuda_sync()
-            rec.classification_ms = (time.perf_counter() - t0) * 1000.0
-
-            if pred_cat == "0":
-                rec.predicted_type = "cuboid"
-                type_list = ["0"]
-            elif pred_cat == "1":
-                rec.predicted_type = "cone"
-                type_list = ["11", "13"] if not self.legacy_primitives else ["01", "11", "12", "13", "14"]
-            elif pred_cat == "2":
-                rec.predicted_type = "ellipsoid"
-                type_list = ["2"]
-            else:
-                rec.predicted_type = "cuboid"
-                type_list = ["0"]
-        else:
-            rec.classification_ms = 0.0
-            rec.predicted_type = "none"
-            # Without classifier: execute full multi-primitive Chamfer competitive fitting
-            if self.legacy_primitives:
-                type_list = ["0", "01", "1", "11", "12", "13", "14", "2"]
-            else:
-                type_list = ["0", "11", "13", "2"]
-
-        # --- Stage 5: Primitive Shape Fitting ---
+        cuda_sync()
         t0 = time.perf_counter()
-        best_cls = type_list[0] if type_list else "0"
-        best_params = None
-        best_pcd_fit = None
-        min_dist = float("inf")
+        ranked_categories = (
+            self.classifier.predict_ranked(pcd)
+            if (self.classifier and pcd and len(pcd.points) > 0)
+            else [("0", 1.0)]
+        )
+        cuda_sync()
+        rec.classification_ms = (time.perf_counter() - t0) * 1000.0
 
-        for tp in type_list:
+        pred_cat = ranked_categories[0][0] if ranked_categories else "0"
+        if pred_cat == "0":
+            rec.predicted_type = "cuboid"
+        elif pred_cat == "1":
+            rec.predicted_type = "cone"
+        elif pred_cat == "2":
+            rec.predicted_type = "ellipsoid"
+        else:
+            rec.predicted_type = "cuboid"
+
+        # --- Stage 5: Primitive Shape Fitting (Prior-Guided Threshold Early-Exit) ---
+        t0 = time.perf_counter()
+        tau_exit = getattr(self, "fitting_threshold_exit", 2.0)
+        best_params = []
+        best_cls = pred_cat
+        best_cd = float("inf")
+
+        for rank_idx, (cat_code, conf) in enumerate(ranked_categories):
             try:
-                params = self.fbg.fitting(pcd, tp)
-            except Exception:
-                continue
-            if not params:
+                cand_params = self.fbg.fitting(pcd, cat_code)
+            except Exception as exc:
+                logger.warning("Targeted fitting %s failed: %s", cat_code, exc)
                 continue
 
-            # Generate synthetic point cloud
-            if tp in ("0", "01"):
-                pts = generate_cube_points(np.array(params[:3]) * 2, total_points=self.fitting_synthetic_points)
-            elif tp in ("1", "11", "12", "13", "14"):
-                r1, r2, h, _ = params
-                if r1 <= 1e-4 or r2 <= 1e-4 or h <= 1e-4 or np.isnan(r1) or np.isnan(r2):
-                    continue
-                pts = generate_cone_points(r_bottom=r2, r_top_ratio=r1 / r2, height=h, total_points=self.fitting_synthetic_points)
-            elif tp == "2":
-                pts = generate_ellipsoid_points(*params[:3], total_points=self.fitting_synthetic_points)
+            if not cand_params:
+                continue
+
+            # Fast evaluation for threshold check (2000 points optimal balance)
+            if cat_code in ("0", "01"):
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=2000
+                )
+            elif cat_code in ("1", "11", "12", "13", "14"):
+                r1, r2, h, _ = cand_params
+                pts = generate_cone_points(
+                    r_bottom=r2,
+                    r_top_ratio=r1 / r2 if r2 > 1e-6 else 1.0,
+                    height=h,
+                    total_points=2000,
+                )
+            elif cat_code == "2":
+                pts = generate_ellipsoid_points(
+                    *cand_params[:3], total_points=2000
+                )
             else:
-                continue
+                pts = generate_cube_points(
+                    np.array(cand_params[:3]) * 2, total_points=2000
+                )
 
-            fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
-            dist_cloud = o3d.geometry.PointCloud(fit_cloud)
-            dist_cloud.transform(params[-1])
+            cand_fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+            dist_cloud = o3d.geometry.PointCloud(cand_fit_cloud)
+            dist_cloud.transform(cand_params[-1])
+            cd = compute_trimmed_distance(pcd, dist_cloud, inlier_ratio=0.90)
 
-            d1 = pcd.compute_point_cloud_distance(dist_cloud)
-            d2 = dist_cloud.compute_point_cloud_distance(pcd)
-            dist_score = float(np.mean(d1) + np.mean(d2))
+            if cd < best_cd:
+                best_cd = cd
+                best_cls = cat_code
+                best_params = cand_params
 
-            if dist_score < min_dist:
-                min_dist = dist_score
-                best_cls = tp
-                best_params = params
-                best_pcd_fit = fit_cloud
+            if cd <= tau_exit:
+                break
+
+        if not best_params and best_cls != "0":
+            best_cls = "0"
+            try:
+                best_params = self.fbg.fitting(pcd, "0")
+            except Exception as exc:
+                logger.error("Fallback cuboid fitting also failed: %s", exc)
+                best_params = []
 
         rec.fitting_ms = (time.perf_counter() - t0) * 1000.0
         if best_cls in ("0", "01"):
             rec.primitive_type = "cuboid"
+            pts = generate_cube_points(
+                np.array(best_params[:3]) * 2, total_points=self.fitting_synthetic_points
+            ) if best_params else np.zeros((0, 3))
         elif best_cls in ("1", "11", "12", "13", "14"):
             rec.primitive_type = "cone"
+            if best_params:
+                r1, r2, h, _ = best_params
+                pts = generate_cone_points(
+                    r_bottom=r2,
+                    r_top_ratio=r1 / r2 if r2 > 1e-6 else 1.0,
+                    height=h,
+                    total_points=self.fitting_synthetic_points,
+                )
+            else:
+                pts = np.zeros((0, 3))
         elif best_cls == "2":
             rec.primitive_type = "ellipsoid"
+            pts = generate_ellipsoid_points(
+                *best_params[:3], total_points=self.fitting_synthetic_points
+            ) if best_params else np.zeros((0, 3))
+        else:
+            rec.primitive_type = "cuboid"
+            pts = generate_cube_points(
+                np.array(best_params[:3]) * 2, total_points=self.fitting_synthetic_points
+            ) if best_params else np.zeros((0, 3))
+
+        fit_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        best_pcd_fit = fit_cloud
+
+        # Metric-only single distance computation outside of fitting_ms timing window
+        if best_params and pcd and len(pcd.points) > 0 and len(fit_cloud.points) > 0:
+            dist_cloud = o3d.geometry.PointCloud(fit_cloud)
+            dist_cloud.transform(best_params[-1])
+            rec.chamfer_distance = compute_trimmed_distance(pcd, dist_cloud, inlier_ratio=0.90)
+        else:
+            rec.chamfer_distance = float("nan")
 
         # Flag anomalous long tail (if execution takes > 15 seconds)
         if rec.fitting_ms > 15000.0:
@@ -500,7 +553,7 @@ class LatencyBenchmarkRunner:
         # --- Stage 6: Grasp Manifold Generation & Physical Filtering ---
         t0 = time.perf_counter()
         ppose = []
-        if best_params is not None:
+        if best_params:
             t_OC = best_params[-1]
             is_center = any(kw in instruction.lower() for kw in self.center_keywords)
             is_side = any(kw in instruction.lower() for kw in self.side_keywords)
@@ -511,11 +564,25 @@ class LatencyBenchmarkRunner:
                     else PickPose.gen_cube_end_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth)
             elif best_cls in ("1", "11", "12", "13", "14"):
                 if is_center:
-                    ppose = PickPose.gen_cone_center_pick_poses(best_params[2], self.cone_num_positions, gripper_depth=self.gripper_depth_center)
+                    ppose = PickPose.gen_cone_center_pick_poses(
+                        best_params[2],
+                        self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_center,
+                    )
                 elif is_side:
-                    ppose = PickPose.gen_cone_side_pick_poses(best_params[2], best_params[0], best_params[1], num_each_side=self.cone_num_positions, gripper_depth=self.gripper_depth_side)
+                    ppose = PickPose.gen_cone_side_pick_poses(
+                        best_params[2],
+                        best_params[0],
+                        best_params[1],
+                        num_each_side=self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_side,
+                    )
                 else:
-                    ppose = PickPose.gen_cone_end_pick_poses(best_params[2], self.cone_num_positions, gripper_depth=self.gripper_depth_end)
+                    ppose = PickPose.gen_cone_end_pick_poses(
+                        best_params[2],
+                        self.cone_num_positions,
+                        gripper_depth=self.gripper_depth_end,
+                    )
             elif best_cls == "2":
                 ppose = PickPose.gen_ellipsoid_center_pick_poses(self.ellipsoid_num_directions)
             else:
@@ -529,13 +596,28 @@ class LatencyBenchmarkRunner:
                     ppose[i] = self.T_BC_Cali * t_OC * p
 
             # Z-axis approach filter
-            ppose = filter_pose_by_axis_diff(ppose, axis=2, ref_axis=[0, 0, -1], t=self.z_axis_filter_threshold, sorted=True)
+            ppose = filter_pose_by_axis_diff(
+                ppose, axis=2, ref_axis=[0, 0, -1], t=self.z_axis_filter_threshold, sorted=True
+            )
+            downward_poses = list(ppose)
 
             # Gripper aperture range filter
             if not is_side and best_pcd_fit is not None:
                 pcd_model = o3d.geometry.PointCloud(best_pcd_fit)
                 pcd_model.transform(self.T_BC_Cali * t_OC)
-                ppose = check_pick_pose_for_2finger_gripper_range(pcd_model, ppose, self.finger_range)
+                filtered = check_pick_pose_for_2finger_gripper_range(
+                    pcd_model, ppose, self.finger_range
+                )
+                if len(filtered) == 0 and len(downward_poses) > 0:
+                    logger.warning(
+                        "All poses rejected by gripper aperture check; falling back to %d downward poses.",
+                        len(downward_poses),
+                    )
+                    ppose = downward_poses
+                else:
+                    ppose = filtered
+            elif len(ppose) == 0 and len(downward_poses) > 0:
+                ppose = downward_poses
         rec.grasp_ms = (time.perf_counter() - t0) * 1000.0
 
         # --- Stage 7: Quintic Polynomial Trajectory Planning ---
@@ -605,6 +687,7 @@ def _aggregate_stats(records: list[TimingRecord]) -> dict[str, dict[str, float]]
             for r in records
         ]),
         ("total", [r.total_pipeline_ms for r in records]),
+        ("chamfer_distance", [r.chamfer_distance for r in records if not np.isnan(r.chamfer_distance) and r.chamfer_distance > 0]),
     ]
     stats: dict[str, dict[str, float]] = {}
     for name, vals in stages:
@@ -650,7 +733,6 @@ def print_ascii_table(stats_dict: dict[str, Any], num_sessions: int, mode: str, 
     cls_labels = {
         "mamba3d": "Stage 4: Mamba3D Geometric Classification",
         "pointnet2": "Stage 4: PointNet2 Geometric Classification",
-        "none": "Stage 4: Geometric Classification (None/Skipped)",
     }
     stage4_label = cls_labels.get(classifier.lower(), f"Stage 4: {classifier} Classification")
 
@@ -667,13 +749,13 @@ def print_ascii_table(stats_dict: dict[str, Any], num_sessions: int, mode: str, 
         ("sam", "Stage 2: SAM Instance Segmentation", typ["sam"]),
         ("pointcloud", "Stage 3: PointCloud Back-Projection", typ["pointcloud"]),
         ("classification", stage4_label, typ["classification"]),
-        ("fitting", "Stage 5: Shape Fitting", typ["fitting"]),
+        ("fitting", "Stage 5: Shape Fitting (Single-Shot)", typ["fitting"]),
         ("grasp", "Stage 6: Pose Generation & Filtering", typ["grasp"]),
         ("trajectory", "Stage 7: Quintic Trajectory Planning", typ["trajectory"]),
     ]
 
     for key, label, s in typical_labels:
-        if s["count"] == 0 or (key == "classification" and s["mean"] == 0.0 and classifier == "none"):
+        if s["count"] == 0:
             print(f"{label:<44} | {'[SKIPPED / N/A]':<18} | {'-':<16} | {'-':<10} | {s['count']}")
             continue
         mean_std = f"{s['mean']:6.1f} ± {s['std']:4.1f}"
@@ -681,12 +763,19 @@ def print_ascii_table(stats_dict: dict[str, Any], num_sessions: int, mode: str, 
         share = (s["mean"] / tot_mean) * 100.0
         print(f"{label:<44} | {mean_std:<18} | {interval:<16} | {share:6.1f}%    | {s['count']}")
 
+    # Chamfer distance metric monitoring (isolated from fitting latency)
+    cd_stat = typ.get("chamfer_distance")
+    if cd_stat and cd_stat["count"] > 0:
+        cd_mean_std = f"{cd_stat['mean']:6.4f} ± {cd_stat['std']:5.4f}"
+        cd_interval = f"[{cd_stat['min']:5.4f}, {cd_stat['max']:5.4f}]"
+        print(f"{'Reconstruction Chamfer Error (Metric Only)':<44} | {cd_mean_std:<18} | {cd_interval:<16} | {'[METRIC]':<10} | {cd_stat['count']}")
+
     # 2. Primitive fitting breakdown
     print("-" * 96)
     print(f"{'--- STAGE 5: PRIMITIVE FITTING BREAKDOWN BY CATEGORY ---':<96}")
     prim_rows = [
-        ("5a. Cuboid Analytic (Fast)", stats_dict["cuboid"]["fitting"]),
-        ("5b. Cone Multi-Topo Slicing", stats_dict["cone"]["fitting"]),
+        ("5a. Cuboid Analytic Fit", stats_dict["cuboid"]["fitting"]),
+        ("5b. Cone Single-Shot Fit", stats_dict["cone"]["fitting"]),
         ("5c. Ellipsoid Analytic Fit", stats_dict["ellipsoid"]["fitting"]),
     ]
     for label, s in prim_rows:
@@ -738,12 +827,10 @@ def generate_latex_table(stats_dict: dict[str, Any], classifier: str = "mamba3d"
             return f"${s['mean']:.2f} \\pm {s['std']:.2f}$ (${s['min']:.2f}\\text{{--}}{s['max']:.2f}$)"
         return f"${s['mean']:.1f} \\pm {s['std']:.1f}$ (${s['min']:.1f}\\text{{--}}{s['max']:.1f}$)"
 
-    if classifier == "mamba3d":
-        cls_row = rf"Stage 4: Mamba3D 几何特征分类 & {fmt_cell(clf)} & $\mathcal{{O}}(N)$ & 双向状态空间模型选择性扫描（CUDA GPU 加速） \\"
-    elif classifier == "pointnet2":
+    if classifier == "pointnet2":
         cls_row = rf"Stage 4: PointNet2 几何特征分类 & {fmt_cell(clf)} & $\mathcal{{O}}(N \log N)$ & 多尺度分组分层点云特征提取与分类 \\"
     else:
-        cls_row = rf"Stage 4: 几何特征分类 (无/跳过) & {fmt_cell(clf)} & -- & 全基元 Chamfer 竞争匹配模式 \\"
+        cls_row = rf"Stage 4: Mamba3D 几何特征分类 & {fmt_cell(clf)} & $\mathcal{{O}}(N)$ & 双向状态空间模型选择性扫描（CUDA GPU 加速） \\"
 
     latex = rf"""\begin{{table}}[htbp]
         \centering
@@ -766,7 +853,7 @@ def generate_latex_table(stats_dict: dict[str, Any], classifier: str = "mamba3d"
                 {cls_row}
                 Stage 5: Shape Fitting  & {fmt_cell(fit_all)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 基于神经分类导向的单几何基元解析与 RANSAC 鲁棒拟合 \\
                 \quad 长方体基元快速拟合 & {fmt_cell(cuboid_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 单模型解析平面法向与 OBB 几何尺寸解算 \\
-                \quad 圆锥台多拓扑拟合   & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{topo}}}} K_{{\mathrm{{cir}}}} N)$ & 遍历切片圆代数拟合与母线回归（剪枝拓扑集） \\
+                \quad 圆锥台自适应门限拟合   & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{axis}}}} K_{{\mathrm{{cir}}}} N)$ & 多假设主轴门限早停、12层切片截面圆代数拟合与母线回归 \\
                 \quad 椭球体解析特征拟合 & {fmt_cell(ellip_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot 3^3)$      & 实对称矩阵闭式特征值分解与向量化 RANSAC \\
                 Stage 6: 候选位姿生成与过滤 & {fmt_cell(grp)} & $\mathcal{{O}}(N_{{\mathrm{{cand}}}})$                   & 几何限位、解析 IK 可达性与 Coal 碰撞干涉检测 \\
                 Stage 7: 五次多项式轨迹规划 & {fmt_cell(trj)} & $\mathcal{{O}}(N_{{\mathrm{{joints}}}} \cdot 6)$         & 闭式多项式矩阵求逆（式\eqref{{eq:ch5_quintic_sol}}）与路径离散采样 \\
@@ -796,8 +883,8 @@ def main():
                         help="Run across all available subsets: single, multi, position.")
     parser.add_argument("--mode", choices=["auto", "full", "geometry"], default="auto",
                         help="Benchmark mode: full (neural net + geometry), geometry (skip heavy weights), auto.")
-    parser.add_argument("--classifier", choices=["mamba3d", "pointnet2", "none"], default="mamba3d",
-                        help="Geometric shape classifier backend (mamba3d, pointnet2, none). Default: mamba3d.")
+    parser.add_argument("--classifier", choices=["mamba3d", "pointnet2"], default="mamba3d",
+                        help="Geometric shape classifier backend (mamba3d, pointnet2). Default: mamba3d.")
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Optional custom checkpoint weights path for the classifier.")
     parser.add_argument("--warmup", type=int, default=2,

@@ -373,60 +373,63 @@ def generate_cube_points(
     assert points_density >= 0, "number of points density should >= 0"
     assert total_points > 0, "number of points should > 0"
 
-    half_size = np.array(size) / 2
-    points = []
-
-    area1 = size[0] * size[1]  # top/bottom
+    half_size = np.asarray(size, dtype=np.float64) / 2.0
+    area1 = size[0] * size[1]  # top/bottom (xy)
     area2 = size[1] * size[2]  # left/right (yz)
     area3 = size[0] * size[2]  # front/back (xz)
-    total_area = 2 * (area1 + area2 + area3)
+    total_area = 2.0 * (area1 + area2 + area3)
+    if total_area <= 1e-12:
+        return np.zeros((0, 3), dtype=np.float64)
 
-    def _noise():
-        return np.random.uniform(-1, 1) * delta
+    def _noise(n):
+        return np.random.uniform(-delta, delta, size=(n,)) if delta > 0 else 0.0
 
-    # Top and bottom surfaces
     if points_density != 0:
-        num_points_tb = int(size[0] * size[1] * points_density)
+        n_tb = max(1, int(area1 * points_density))
+        n_yz = max(1, int(area2 * points_density))
+        n_xz = max(1, int(area3 * points_density))
     else:
-        num_points_tb = int(total_points * (area1 / total_area))
-    for _ in range(num_points_tb):
-        x = np.random.uniform(-1, 1) * half_size[0]
-        y = np.random.uniform(-1, 1) * half_size[1]
-        points.append([x + _noise(), y + _noise(), half_size[2] + _noise()])
-    for _ in range(num_points_tb):
-        x = np.random.uniform(-1, 1) * half_size[0]
-        y = np.random.uniform(-1, 1) * half_size[1]
-        points.append([x + _noise(), y + _noise(), -half_size[2] + _noise()])
+        n_tb = max(1, int(total_points * (area1 / total_area)))
+        n_yz = max(1, int(total_points * (area2 / total_area)))
+        n_xz = max(1, int(total_points * (area3 / total_area)))
 
-    # Left/right surfaces (yz)
-    if points_density != 0:
-        num_point_yz = int(size[1] * size[2] * points_density)
-    else:
-        num_point_yz = int(total_points * (area2 / total_area))
-    for _ in range(num_point_yz):
-        y = np.random.uniform(-1, 1) * half_size[1]
-        z = np.random.uniform(-1, 1) * half_size[2]
-        points.append([half_size[0] + _noise(), y + _noise(), z + _noise()])
-    for _ in range(num_point_yz):
-        y = np.random.uniform(-1, 1) * half_size[1]
-        z = np.random.uniform(-1, 1) * half_size[2]
-        points.append([-half_size[0] + _noise(), y + _noise(), z + _noise()])
+    # Top & Bottom (xy)
+    p_top = np.column_stack((
+        np.random.uniform(-half_size[0], half_size[0], n_tb) + _noise(n_tb),
+        np.random.uniform(-half_size[1], half_size[1], n_tb) + _noise(n_tb),
+        np.full(n_tb, half_size[2]) + _noise(n_tb),
+    ))
+    p_bot = np.column_stack((
+        np.random.uniform(-half_size[0], half_size[0], n_tb) + _noise(n_tb),
+        np.random.uniform(-half_size[1], half_size[1], n_tb) + _noise(n_tb),
+        np.full(n_tb, -half_size[2]) + _noise(n_tb),
+    ))
 
-    # Front/back surfaces (xz)
-    if points_density != 0:
-        num_point_xz = int(size[0] * size[2] * points_density)
-    else:
-        num_point_xz = int(total_points * (area3 / total_area))
-    for _ in range(num_point_xz):
-        x = np.random.uniform(-1, 1) * half_size[0]
-        z = np.random.uniform(-1, 1) * half_size[2]
-        points.append([x + _noise(), half_size[1] + _noise(), z + _noise()])
-    for _ in range(num_point_xz):
-        x = np.random.uniform(-1, 1) * half_size[0]
-        z = np.random.uniform(-1, 1) * half_size[2]
-        points.append([x + _noise(), -half_size[1] + _noise(), z + _noise()])
+    # Left & Right (yz)
+    p_right = np.column_stack((
+        np.full(n_yz, half_size[0]) + _noise(n_yz),
+        np.random.uniform(-half_size[1], half_size[1], n_yz) + _noise(n_yz),
+        np.random.uniform(-half_size[2], half_size[2], n_yz) + _noise(n_yz),
+    ))
+    p_left = np.column_stack((
+        np.full(n_yz, -half_size[0]) + _noise(n_yz),
+        np.random.uniform(-half_size[1], half_size[1], n_yz) + _noise(n_yz),
+        np.random.uniform(-half_size[2], half_size[2], n_yz) + _noise(n_yz),
+    ))
 
-    return points
+    # Front & Back (xz)
+    p_front = np.column_stack((
+        np.random.uniform(-half_size[0], half_size[0], n_xz) + _noise(n_xz),
+        np.full(n_xz, half_size[1]) + _noise(n_xz),
+        np.random.uniform(-half_size[2], half_size[2], n_xz) + _noise(n_xz),
+    ))
+    p_back = np.column_stack((
+        np.random.uniform(-half_size[0], half_size[0], n_xz) + _noise(n_xz),
+        np.full(n_xz, -half_size[1]) + _noise(n_xz),
+        np.random.uniform(-half_size[2], half_size[2], n_xz) + _noise(n_xz),
+    ))
+
+    return np.vstack((p_top, p_bot, p_right, p_left, p_front, p_back))
 
 
 def generate_cone_points(
@@ -456,58 +459,58 @@ def generate_cone_points(
     assert total_points > 0, "number of points should > 0"
 
     r_top = r_bottom * r_top_ratio
-    half_height = height / 2
-    points = []
+    half_height = height / 2.0
 
     area_top = np.pi * r_top * r_top
     area_bottom = np.pi * r_bottom * r_bottom
     slant = np.sqrt((r_bottom - r_top) ** 2 + height**2)
     area_lateral = np.pi * (r_top + r_bottom) * slant
     total_area = area_top + area_bottom + area_lateral
+    if total_area <= 1e-12:
+        return np.zeros((0, 3), dtype=np.float64)
 
-    def _noise():
-        return np.random.uniform(-1, 1) * delta
+    def _noise(n):
+        return np.random.uniform(-delta, delta, size=(n,)) if delta > 0 else 0.0
+
+    if points_density != 0:
+        num_top = max(1, int(area_top * points_density))
+        num_bottom = max(1, int(area_bottom * points_density))
+        num_lateral = max(1, int(area_lateral * points_density))
+    else:
+        num_top = max(1, int(total_points * (area_top / total_area)))
+        num_bottom = max(1, int(total_points * (area_bottom / total_area)))
+        num_lateral = max(1, int(total_points * (area_lateral / total_area)))
 
     # Top cap
-    if points_density != 0:
-        num_top = int(np.pi * r_top * r_top * points_density)
-    else:
-        num_top = int(total_points * (area_top / total_area))
-    for _ in range(num_top):
-        r = np.random.uniform() * r_top
-        phi = 2 * np.pi * np.random.rand()
-        x = r * np.cos(phi)
-        y = r * np.sin(phi)
-        points.append([x + _noise(), y + _noise(), half_height + _noise()])
+    r_top_pts = np.sqrt(np.random.rand(num_top)) * r_top
+    phi_top = 2.0 * np.pi * np.random.rand(num_top)
+    pts_top = np.column_stack((
+        r_top_pts * np.cos(phi_top) + _noise(num_top),
+        r_top_pts * np.sin(phi_top) + _noise(num_top),
+        np.full(num_top, half_height) + _noise(num_top),
+    ))
 
     # Bottom cap
-    if points_density != 0:
-        num_bottom = int(np.pi * r_bottom * r_bottom * points_density)
-    else:
-        num_bottom = int(total_points * (area_bottom / total_area))
-    for _ in range(num_bottom):
-        r = np.random.uniform() * r_bottom
-        phi = 2 * np.pi * np.random.rand()
-        x = r * np.cos(phi)
-        y = r * np.sin(phi)
-        points.append([x + _noise(), y + _noise(), -half_height + _noise()])
+    r_bot_pts = np.sqrt(np.random.rand(num_bottom)) * r_bottom
+    phi_bot = 2.0 * np.pi * np.random.rand(num_bottom)
+    pts_bottom = np.column_stack((
+        r_bot_pts * np.cos(phi_bot) + _noise(num_bottom),
+        r_bot_pts * np.sin(phi_bot) + _noise(num_bottom),
+        np.full(num_bottom, -half_height) + _noise(num_bottom),
+    ))
 
     # Lateral surface
-    if points_density != 0:
-        num_lateral = int(np.pi * (r_top + r_bottom) * slant * points_density)
-    else:
-        num_lateral = int(total_points * (area_lateral / total_area))
-    for _ in range(num_lateral):
-        ratio = np.random.uniform(-1, 1)
-        ratio_0_1 = (ratio + 1) / 2
-        z = ratio * half_height
-        r = ratio_0_1 * (r_top - r_bottom) + r_bottom
-        phi = 2 * np.pi * np.random.rand()
-        x = r * np.cos(phi)
-        y = r * np.sin(phi)
-        points.append([x + _noise(), y + _noise(), z + _noise()])
+    u = np.random.rand(num_lateral)
+    z_lat = (2.0 * u - 1.0) * half_height
+    r_lat = u * (r_top - r_bottom) + r_bottom
+    phi_lat = 2.0 * np.pi * np.random.rand(num_lateral)
+    pts_lateral = np.column_stack((
+        r_lat * np.cos(phi_lat) + _noise(num_lateral),
+        r_lat * np.sin(phi_lat) + _noise(num_lateral),
+        z_lat + _noise(num_lateral),
+    ))
 
-    return np.array(points)
+    return np.vstack((pts_top, pts_bottom, pts_lateral))
 
 
 def generate_ellipsoid_points(a=10, b=10, c=10, total_points=10000):
@@ -834,3 +837,36 @@ def check_pick_pose_for_2finger_gripper_range(pcd, poses, finger_range):
         else:
             print(f"range_y: {range_y}, finger_range: {finger_range}")
     return filtered
+
+
+# =============================================================================
+# Trimmed Distance Metric
+# =============================================================================
+
+
+def compute_trimmed_distance(
+    pcd: o3d.geometry.PointCloud,
+    fit_pcd: o3d.geometry.PointCloud,
+    inlier_ratio: float = 0.90,
+) -> float:
+    """Compute robust trimmed point cloud distance (focusing on the closest inlier_ratio fraction).
+
+    Filters out extreme boundary noise, flying pixels, and contact-surface artifacts.
+    Evaluates how closely the fitted primitive surface matches the true visible workpiece surface.
+
+    Args:
+        pcd: Observed point cloud from depth camera.
+        fit_pcd: Synthetic point cloud generated from fitted primitive.
+        inlier_ratio: Ratio of closest points to retain (default 0.90).
+
+    Returns:
+        Mean distance (in mm) of the closest inlier_ratio fraction of points.
+    """
+    if pcd is None or fit_pcd is None or len(pcd.points) == 0 or len(fit_pcd.points) == 0:
+        return float("inf")
+    d1 = np.asarray(pcd.compute_point_cloud_distance(fit_pcd), dtype=np.float64)
+    if len(d1) == 0:
+        return float("inf")
+    d1_sorted = np.sort(d1)
+    k = max(1, int(round(inlier_ratio * len(d1_sorted))))
+    return float(np.mean(d1_sorted[:k]))

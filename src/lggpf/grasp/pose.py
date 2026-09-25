@@ -305,6 +305,7 @@ class PickPose:
             pick_poses.append(top_T2 * SE3.Rz(np.pi / 2))
             pick_poses.append(bottom_T * SE3.Rz(np.pi / 2))
             pick_poses.append(bottom_T2 * SE3.Rz(np.pi / 2))
+
         return pick_poses
 
     @staticmethod
@@ -345,6 +346,7 @@ class PickPose:
             center_T2 = SE3.Rt(SO3.Ry(-pi / 2) * SO3.Rx(t), center)
             pick_poses.append(center_T1)
             pick_poses.append(center_T2)
+
         return pick_poses
 
     @staticmethod

@@ -22,6 +22,7 @@ from .pointcloud import (
     filter_pose_by_bin_side,
     check_pick_pose_for_2finger_gripper,
     check_pick_pose_for_2finger_gripper_range,
+    compute_trimmed_distance,
 )
 
 __all__ = [
@@ -46,4 +47,5 @@ __all__ = [
     "filter_pose_by_bin_side",
     "check_pick_pose_for_2finger_gripper",
     "check_pick_pose_for_2finger_gripper_range",
+    "compute_trimmed_distance",
 ]

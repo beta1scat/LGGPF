@@ -177,9 +177,13 @@ Each generated figure contains 6 synchronized subplots:
 - **(a) OWLv2 目标检测定位 (Open-Vocabulary Detection)**: High-resolution bounding box with cross-modal alignment score.
 - **(b) SAM 提示式实例分割 (Prompted Instance Segmentation)**: Color-coded mask overlay with pixel count statistics.
 - **(c) 点云逆投影与表面法向场 (Point Cloud & Surface Normals)**: Perspective depth unprojection with camera-oriented normal vectors.
-- **(d) 基元拟合 (Primitive Fitting)**: 3D wireframe manifold for cuboids, truncated cones, or ellipsoids.
+- **(d) 神经导向几何基元拟合 (Neural-Guided Primitive Fitting)**: 3D wireframe manifold for cuboids, truncated cones, or ellipsoids.
 - **(e) 候选抓取位姿与夹爪 (Candidate Grasp Poses & Gripper)**: Discrete candidate grasp poses with 3D physical two-finger gripper model.
 - **(f) 五次多项式 $C^2$ 平滑轨迹 (Quintic Trajectory Planning)**: 3D spatial approach, descent, and lift trajectories with workpiece point cloud and compact legend.
+
+**Structured Diagnostics & Terminal ASCII Cards**:
+- Automatically exports a companion structured JSON file (`<session>_diag.json`) recording millisecond-accurate stage latencies, Mamba3D / PointNet2 category rankings, sequential fitting hypothesis traces with trimmed distance errors and early-exit thresholds, grasp manifold filtering counts, and artifact locations.
+- Prints a standardized 76-character wide unicode box diagnostic card in the terminal console for instant verification of the end-to-end decision chain.
 
 **Usage Examples**:
 ```bash

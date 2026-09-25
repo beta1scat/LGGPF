@@ -80,6 +80,8 @@ pipeline:
   fitting_max_points: 5000
   # Fitting: synthetic point cloud density for shape comparison
   fitting_synthetic_points: 5000
+  # Threshold early-exit tolerance for primitive shape fitting (trimmed distance in mm)
+  fitting_threshold_exit: 2.0
   # Grasp pose generation parameters
   grasp:
     z_axis_filter_threshold: 0.7853981633974483  # pi/4
