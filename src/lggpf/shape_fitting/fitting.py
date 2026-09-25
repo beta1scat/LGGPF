@@ -1048,14 +1048,9 @@ class FittingByBGS:
     """Dispatcher that selects and runs the appropriate fitting algorithm.
 
     Shape class codes:
-      - ``'0'``:  Cuboid via RANSAC plane + OBB
-      - ``'01'``: Cuboid via OBB only
-      - ``'1'``:  Truncated cone via normal clustering (plane-based)
-      - ``'11'``: Truncated cone via OBB
-      - ``'12'``: Truncated cone via normal clustering (RANSAC axis)
-      - ``'13'``: Truncated cone via PCA (component 0)
-      - ``'14'``: Truncated cone via PCA (component 2)
-      - ``'2'``:  Ellipsoid via RANSAC + least-squares
+      - ``'0'``:  Cuboid via RANSAC plane segmentation + OBB (with automatic OBB fallback)
+      - ``'1'``:  Truncated cone via sequential adaptive hypothesis fitting (threshold early-exit)
+      - ``'2'``:  Ellipsoid via algebraic least-squares + fast geometric fallback
     """
 
     def __init__(self):
@@ -1069,7 +1064,7 @@ class FittingByBGS:
 
         Args:
             pcd: Open3D point cloud (with normals for cone methods).
-            cls: Shape class code string.
+            cls: Shape class code string ("0", "1", "2").
             visual: Show debug visualization.
 
         Returns:
@@ -1103,13 +1098,6 @@ class FittingByBGS:
                 self._visualize_cuboid(pcd, pcd_fit, a, b, c, T)
             params = [a, b, c, T]
 
-        elif cls == "01":
-            a, b, c, T = fit_cuboid_obb(pcd_fit)
-            self.last_method = "obb"
-            if visual:
-                self._visualize_cuboid(pcd, pcd_fit, a, b, c, T)
-            params = [a, b, c, T]
-
         elif cls == "1":
             try:
                 r1, r2, height, T, method, res = fit_frustum_cone_adaptive(
@@ -1122,39 +1110,6 @@ class FittingByBGS:
                 self.last_fallback_triggered = True
                 self.last_fallback_type = "pca_slice_fallback"
                 self.last_error = f"cone_adaptive_fallback: {type(exc).__name__}: {exc}"
-            if visual:
-                self._visualize_cone(pcd, r1, r2, height, T)
-            params = [r1, r2, height, T]
-
-        elif cls == "11":
-            r1, r2, height, T = fit_frustum_cone_obb(pcd_fit)
-            self.last_method = "cone_obb"
-            if visual:
-                self._visualize_cone(pcd, r1, r2, height, T)
-            params = [r1, r2, height, T]
-
-        elif cls == "12":
-            r1, r2, height, T = fit_frustum_cone_normal(
-                pcd_fit,
-                plane_t=0.01,
-                normal_t=0.02,
-                use_plane_normal=False,
-            )
-            self.last_method = "ransac_normal_slice"
-            if visual:
-                self._visualize_cone(pcd, r1, r2, height, T)
-            params = [r1, r2, height, T]
-
-        elif cls == "13":
-            r1, r2, height, T = fit_frustum_cone_pca(pcd_fit, z_dir=0)
-            self.last_method = "pca_slice_z0"
-            if visual:
-                self._visualize_cone(pcd, r1, r2, height, T)
-            params = [r1, r2, height, T]
-
-        elif cls == "14":
-            r1, r2, height, T = fit_frustum_cone_pca(pcd_fit, z_dir=2)
-            self.last_method = "pca_slice_z2"
             if visual:
                 self._visualize_cone(pcd, r1, r2, height, T)
             params = [r1, r2, height, T]

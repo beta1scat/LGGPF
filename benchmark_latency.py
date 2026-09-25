@@ -464,11 +464,11 @@ class LatencyBenchmarkRunner:
                 continue
 
             # Fast evaluation for threshold check (2000 points optimal balance)
-            if cat_code in ("0", "01"):
+            if cat_code == "0":
                 pts = generate_cube_points(
                     np.array(cand_params[:3]) * 2, total_points=2000
                 )
-            elif cat_code in ("1", "11", "12", "13", "14"):
+            elif cat_code == "1":
                 r1, r2, h, _ = cand_params
                 pts = generate_cone_points(
                     r_bottom=r2,
@@ -507,12 +507,12 @@ class LatencyBenchmarkRunner:
                 best_params = []
 
         rec.fitting_ms = (time.perf_counter() - t0) * 1000.0
-        if best_cls in ("0", "01"):
+        if best_cls == "0":
             rec.primitive_type = "cuboid"
             pts = generate_cube_points(
                 np.array(best_params[:3]) * 2, total_points=self.fitting_synthetic_points
             ) if best_params else np.zeros((0, 3))
-        elif best_cls in ("1", "11", "12", "13", "14"):
+        elif best_cls == "1":
             rec.primitive_type = "cone"
             if best_params:
                 r1, r2, h, _ = best_params
@@ -558,11 +558,11 @@ class LatencyBenchmarkRunner:
             is_center = any(kw in instruction.lower() for kw in self.center_keywords)
             is_side = any(kw in instruction.lower() for kw in self.side_keywords)
 
-            if best_cls in ("0", "01"):
+            if best_cls == "0":
                 depth = self.gripper_depth_center
                 ppose = PickPose.gen_cube_center_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth) if is_center \
                     else PickPose.gen_cube_end_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth)
-            elif best_cls in ("1", "11", "12", "13", "14"):
+            elif best_cls == "1":
                 if is_center:
                     ppose = PickPose.gen_cone_center_pick_poses(
                         best_params[2],

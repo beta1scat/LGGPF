@@ -362,12 +362,7 @@ class PipelineVisualizer:
 
         cat_names = {
             "0": "cuboid",
-            "01": "cuboid",
             "1": "cone/frustum",
-            "11": "cone/frustum",
-            "12": "cone/frustum",
-            "13": "cone/frustum",
-            "14": "cone/frustum",
             "2": "ellipsoid",
         }
 
@@ -381,11 +376,11 @@ class PipelineVisualizer:
             if not cand_params:
                 continue
 
-            if cat_code in ("0", "01"):
+            if cat_code == "0":
                 pts = generate_cube_points(
                     np.array(cand_params[:3]) * 2, total_points=self.fitting_synthetic_points
                 )
-            elif cat_code in ("1", "11", "12", "13", "14"):
+            elif cat_code == "1":
                 r1, r2, h, _ = cand_params
                 pts = generate_cone_points(
                     r_bottom=r2,
@@ -477,9 +472,9 @@ class PipelineVisualizer:
         data["min_dist"] = dist_score
         data["chamfer_distance"] = dist_score
 
-        if target_type in ("0", "01"):
+        if target_type == "0":
             prim_name = "Cuboid"
-        elif target_type in ("1", "11", "12", "13", "14"):
+        elif target_type == "1":
             prim_name = "Frustum Cone"
         elif target_type == "2":
             prim_name = "Ellipsoid"
@@ -506,11 +501,11 @@ class PipelineVisualizer:
             is_center = any(kw in instruction.lower() for kw in self.center_keywords)
             is_side = any(kw in instruction.lower() for kw in self.side_keywords)
 
-            if best_cls in ("0", "01"):
+            if best_cls == "0":
                 depth = self.gripper_depth_center
                 ppose = PickPose.gen_cube_center_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth) if is_center \
                     else PickPose.gen_cube_end_pick_poses([x * 2 for x in best_params[:3]], gripper_depth=depth)
-            elif best_cls in ("1", "11", "12", "13", "14"):
+            elif best_cls == "1":
                 if is_center:
                     ppose = PickPose.gen_cone_center_pick_poses(
                         best_params[2],
@@ -868,7 +863,7 @@ class PipelineVisualizer:
         best_cls = data.get("best_cls", "0")
         best_params = data.get("best_params")
         chamfer_err = data.get("min_dist", 0.0)
-        prim_name_cn = "圆锥台" if best_cls in ("1", "11", "12", "13", "14") else ("长方体" if best_cls in ("0", "01") else "椭球体")
+        prim_name_cn = "圆锥台" if best_cls == "1" else ("长方体" if best_cls == "0" else "椭球体")
 
         # Transform point cloud to Robot Base Frame (B) to ensure 100% visual consistency with (e) and (f)
         T_BC_mat = self.T_BC_Cali.A if isinstance(self.T_BC_Cali, SE3) else np.asarray(self.T_BC_Cali, dtype=np.float64)
@@ -887,13 +882,13 @@ class PipelineVisualizer:
             t_mat = T_BC_mat @ t_mat_c
             origin = t_mat[:3, 3]
 
-            if best_cls in ("0", "01"):
+            if best_cls == "0":
                 size = np.array(best_params[:3]) * 2.0
                 corners, edges = self._create_cuboid_wireframe(size, t_mat)
                 for e in edges:
                     p1, p2 = corners[e[0]], corners[e[1]]
                     ax4.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color="#1E88E5", linewidth=1.8)
-            elif best_cls in ("1", "11", "12", "13", "14"):
+            elif best_cls == "1":
                 r1, r2, h, _ = best_params
                 rings, meridians = self._create_cone_wireframe(r1, r2, h, t_mat)
                 for ring in rings:
@@ -1120,13 +1115,13 @@ class PipelineVisualizer:
             if best_params is not None:
                 t_mat_c = best_params[-1].A if isinstance(best_params[-1], SE3) else np.asarray(best_params[-1], dtype=np.float64)
                 t_mat = T_BC_mat @ t_mat_c
-                if best_cls in ("0", "01"):
+                if best_cls == "0":
                     size = np.array(best_params[:3]) * 2.0
                     corners, edges = self._create_cuboid_wireframe(size, t_mat)
                     for e in edges:
                         p1, p2 = corners[e[0]], corners[e[1]]
                         ax6.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color="#1E88E5", linewidth=1.1, alpha=0.45)
-                elif best_cls in ("1", "11", "12", "13", "14"):
+                elif best_cls == "1":
                     r1, r2, h, _ = best_params
                     rings, meridians = self._create_cone_wireframe(r1, r2, h, t_mat)
                     for ring in rings:
@@ -1262,7 +1257,7 @@ class PipelineVisualizer:
 
         if best_params is not None:
             t_mat = (self.T_BC_Cali * best_params[-1]).A if isinstance(best_params[-1], SE3) else (self.T_BC_Cali * best_params[-1])
-            if best_cls in ("0", "01"):
+            if best_cls == "0":
                 size = np.array(best_params[:3]) * 2.0
                 corners, edges = self._create_cuboid_wireframe(size, t_mat)
                 line_set = o3d.geometry.LineSet()
@@ -1270,7 +1265,7 @@ class PipelineVisualizer:
                 line_set.lines = o3d.utility.Vector2iVector(edges)
                 line_set.paint_uniform_color([0.1, 0.5, 0.9])
                 geoms.append(line_set)
-            elif best_cls in ("1", "11", "12", "13", "14"):
+            elif best_cls == "1":
                 r1, r2, h, _ = best_params
                 rings, meridians = self._create_cone_wireframe(r1, r2, h, t_mat)
                 pts_list = []
@@ -1472,12 +1467,7 @@ def print_diagnostic_card(diag: dict[str, Any]):
     pred_cat = diag.get("neural_classification", {}).get("predicted_category", "")
     cat_lookup = {
         "0": "cuboid",
-        "01": "cuboid",
         "1": "cone/frustum",
-        "11": "cone/frustum",
-        "12": "cone/frustum",
-        "13": "cone/frustum",
-        "14": "cone/frustum",
         "2": "ellipsoid",
     }
     ranked = diag.get("neural_classification", {}).get("ranked_categories", [])

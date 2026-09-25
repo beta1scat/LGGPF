@@ -466,11 +466,11 @@ class GraspingPipeline:
 
             # Generate synthetic points to evaluate Chamfer distance (2000 points optimal balance)
             eval_points = 2000
-            if cat_code in ("0", "01"):
+            if cat_code == "0":
                 pts = generate_cube_points(
                     np.array(cand_params[:3]) * 2, total_points=eval_points
                 )
-            elif cat_code in ("1", "11", "12", "13", "14"):
+            elif cat_code == "1":
                 r1, r2, h, _ = cand_params
                 pts = generate_cone_points(
                     r_bottom=r2,
@@ -524,11 +524,11 @@ class GraspingPipeline:
 
         # Final high-density synthetic point cloud generation (5000 points) for metrics and artifact
         total_points = self.fitting_synthetic_points
-        if target_type in ("0", "01"):
+        if target_type == "0":
             points = generate_cube_points(
                 np.array(params[:3]) * 2, total_points=total_points
             )
-        elif target_type in ("1", "11", "12", "13", "14"):
+        elif target_type == "1":
             r1, r2, height, _ = params
             points = generate_cone_points(
                 r_bottom=r2,
@@ -608,7 +608,7 @@ class GraspingPipeline:
         is_side = any(kw in text for kw in self.side_keywords)
 
         # Generate candidate poses based on shape type
-        if category in ("0", "01"):
+        if category == "0":
             if is_center:
                 ppose = PickPose.gen_cube_center_pick_poses(
                     [x * 2 for x in params[:3]],
@@ -619,7 +619,7 @@ class GraspingPipeline:
                     [x * 2 for x in params[:3]],
                     gripper_depth=self.gripper_depth_center,
                 )
-        elif category in ("1", "11", "12", "13", "14"):
+        elif category == "1":
             if is_center:
                 ppose = PickPose.gen_cone_center_pick_poses(
                     params[2],
