@@ -49,9 +49,21 @@ class VisionLanguageOwlVit:
         else:
             target_sizes = torch.Tensor([image.size[::-1]]).to(self.device)
 
-        results = self.processor.post_process_grounded_object_detection(
-            outputs=outputs, target_sizes=target_sizes, threshold=threshold
-        )
+        if hasattr(self.processor, "post_process_object_detection"):
+            results = self.processor.post_process_object_detection(
+                outputs=outputs, target_sizes=target_sizes, threshold=threshold
+            )
+        elif hasattr(self.processor, "post_process_grounded_object_detection"):
+            results = self.processor.post_process_grounded_object_detection(
+                outputs=outputs, target_sizes=target_sizes, threshold=threshold
+            )
+        elif hasattr(getattr(self.processor, "image_processor", None), "post_process_object_detection"):
+            results = self.processor.image_processor.post_process_object_detection(
+                outputs=outputs, target_sizes=target_sizes, threshold=threshold
+            )
+        else:
+            raise AttributeError("Owlv2Processor has no post_process method for object detection.")
+
         boxes = results[0]["boxes"].to("cpu")
         scores = results[0]["scores"].to("cpu")
         return boxes, scores

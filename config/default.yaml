@@ -51,6 +51,8 @@ models:
   owlv2: "data/models/owlv2-base-patch16-ensemble"
   sam: "data/models/sam_vit_h_4b8939.pth"
   pointnet2: "data/models/best_model_5000.pth"
+  classifier_type: "mamba3d"
+  mamba3d: "data/models/mamba3d_best.pt"
 
 # --- Gripper settings ---
 gripper:
@@ -98,12 +100,10 @@ pipeline:
     acceleration_limits: [10.47198, 10.47198, 10.47198, 10.47198, 10.47198, 10.47198]  # rad/s^2 for RM65 (600 deg/s^2)
 
 
-  # Language-guided type selection keyword mapping
-  # "cup"/"bowl"/"tube" -> cone types, "ball" -> ellipsoid, else -> cuboid
+  # Language-guided grasp strategy keyword mapping
+  # Geometric shape classification is 100% handled by the Mamba3D neural network.
+  # Natural language is exclusively used for grasp strategy hints (center/side).
   language_type_map:
-    cone_keywords: ["cup", "bowl", "tube"]
-    ellipsoid_keywords: ["ball"]
-    # Grasp strategy keywords
     center_keywords: ["center"]
     side_keywords: ["side"]
 

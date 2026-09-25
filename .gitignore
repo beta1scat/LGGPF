@@ -25,6 +25,7 @@ Thumbs.db
 
 # Data & models (large files)
 data/models/*.pth
+data/models/*.pt
 data/models/*.bin
 data/models/*.safetensors
 data/models/owlv2-*/
@@ -35,3 +36,6 @@ output/
 
 # uv
 uv.lock
+wheels/*.whl
+!wheels/.gitkeep
+

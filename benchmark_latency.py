@@ -5,16 +5,18 @@ Primitive Fitting (LGGPF) pipeline on saved experimental sessions in `data/succe
   1. OWLv2 open-vocabulary object detection
   2. SAM prompted instance segmentation
   3. Depth back-projection and point cloud processing / normal estimation
-  4. Multi-primitive competitive RANSAC fitting & Chamfer distance selection
-  5. Candidate grasp manifold generation & 6-level physical filtering
-  6. Quintic polynomial trajectory planning & collision detection
-  7. End-to-end total pipeline latency
+  4. Mamba3D / PointNet2 geometric shape classification
+  5. Shape primitive targeted fitting / competitive Chamfer distance selection
+  6. Candidate grasp manifold generation & 6-level physical filtering
+  7. Quintic polynomial trajectory planning & collision detection
+  8. End-to-end total pipeline latency
 
 Supports:
+  - Classification backends: 'mamba3d' (default), 'pointnet2', 'none' (Chamfer competitive baseline).
   - Dual execution modes:
       * 'full': Runs end-to-end neural network + geometry + planning pipeline.
-      * 'geometry': Runs point cloud unprojection, shape fitting, grasp filtering,
-        and trajectory planning without requiring external heavy model checkpoints.
+      * 'geometry': Runs point cloud unprojection, shape classification/fitting, grasp filtering,
+        and trajectory planning without requiring external heavy VLM/SAM checkpoints.
       * 'auto': Automatically detects whether model weights are present.
   - Granular dataset selection: `--subsets single multi position` or `--all`.
   - Statistical aggregation: Mean, standard deviation, median, min, max, percentage breakdown.
@@ -22,9 +24,9 @@ Supports:
     for Chapter 5 (Table 5.4) of the doctoral dissertation.
 
 Usage:
-  python benchmark_latency.py --mode auto --subsets single
-  python benchmark_latency.py --mode geometry --subsets single multi position
-  python benchmark_latency.py --mode full --data-dir data/success/single
+  python benchmark_latency.py --mode auto --classifier mamba3d --subsets single
+  python benchmark_latency.py --mode geometry --classifier pointnet2 --subsets single multi position
+  python benchmark_latency.py --mode full --classifier none --data-dir data/success/single
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ try:
         filter_pose_by_axis_diff,
         check_pick_pose_for_2finger_gripper_range,
     )
-    from lggpf.shape_fitting import FittingByBGS
+    from lggpf.shape_fitting import FittingByBGS, ShapeClassifier
     from lggpf.grasp import PickPose
 except ImportError as e:
     sys.exit(f"[ERROR] Failed to import lggpf core modules: {e}\n"
@@ -116,15 +118,16 @@ class TimingRecord:
     """Latency metrics for a single evaluation session (in milliseconds)."""
     session_id: str
     primitive_type: str = "cuboid"
+    predicted_type: str = "cuboid"
     is_long_tail: bool = False
     owlv2_ms: float = 0.0
     sam_ms: float = 0.0
     pointcloud_ms: float = 0.0
+    classification_ms: float = 0.0
     fitting_ms: float = 0.0
     grasp_ms: float = 0.0
     trajectory_ms: float = 0.0
     total_pipeline_ms: float = 0.0
-
 
 
 # =============================================================================
@@ -148,11 +151,11 @@ def discover_sessions(base_dir: Path, subsets: list[str]) -> list[SessionData]:
             if not entry.is_dir() or entry.name == "videos":
                 continue
             sess = SessionData(session_id=f"{subset}/{entry.name}", category_subset=subset, folder_path=entry)
-            
+
             img_p = entry / "image.jpg"
             if img_p.exists():
                 sess.image_path = img_p
-            
+
             # Prefer uncompressed tiff for raw metric depth
             depth_tiff = entry / "depth.tiff"
             depth_png = entry / "depth.png"
@@ -192,10 +195,19 @@ def discover_sessions(base_dir: Path, subsets: list[str]) -> list[SessionData]:
 class LatencyBenchmarkRunner:
     """Executes modular benchmarks across experimental recordings."""
 
-    def __init__(self, config_path: Path, mode: str = "auto", legacy_primitives: bool = False):
+    def __init__(
+        self,
+        config_path: Path,
+        mode: str = "auto",
+        legacy_primitives: bool = False,
+        classifier: str = "mamba3d",
+        checkpoint: Path | None = None,
+    ):
         self.cfg = load_config(str(config_path))
         self.mode = mode
         self.legacy_primitives = legacy_primitives
+        self.classifier_type = classifier
+        self.classifier_checkpoint = checkpoint
 
         # Intrinsic and extrinsic parameters
         self.T_ET_Cali, self.T_BC_Cali = get_calibration_matrices(self.cfg)
@@ -221,8 +233,6 @@ class LatencyBenchmarkRunner:
         self.path_time = traj_cfg.get("path_time", 3.0)
 
         lang_cfg = pipe_cfg.get("language_type_map", {})
-        self.cone_keywords = lang_cfg.get("cone_keywords", ["cup", "bowl", "tube"])
-        self.ellipsoid_keywords = lang_cfg.get("ellipsoid_keywords", ["ball"])
         self.center_keywords = lang_cfg.get("center_keywords", ["center"])
         self.side_keywords = lang_cfg.get("side_keywords", ["side"])
 
@@ -234,6 +244,7 @@ class LatencyBenchmarkRunner:
         # Initialize models
         self.vlm = None
         self.seg_model = None
+        self.classifier = None
         self.fbg = FittingByBGS()
         self.robot = None
         self.planner = None
@@ -275,7 +286,7 @@ class LatencyBenchmarkRunner:
             self._init_vlm(owl_path, sam_path)
             self.active_mode = "full"
         elif self.mode == "geometry":
-            logger.info("Executing in 'geometry' mode: testing pointcloud, fitting, grasp, and planning stages.")
+            logger.info("Executing in 'geometry' mode: testing pointcloud, classification, fitting, grasp, and planning stages.")
             self.active_mode = "geometry"
         else:  # auto
             if _HAS_VLM_MODELS and weights_exist:
@@ -285,6 +296,29 @@ class LatencyBenchmarkRunner:
             else:
                 logger.info("Auto-detected: Running 'geometry & planning' benchmark using offline inputs.")
                 self.active_mode = "geometry"
+
+        # Initialize geometric classifier (Mamba3D / PointNet2 / none)
+        self.classifier = None
+        if self.classifier_type != "none":
+            ckpt = str(self.classifier_checkpoint) if self.classifier_checkpoint else None
+            try:
+                self.classifier = ShapeClassifier(
+                    model_type=self.classifier_type,
+                    checkpoint_path=ckpt,
+                    normal_orientation=self.normal_orientation_location,
+                )
+                logger.info(
+                    "Initialized geometric classifier: %s (requested: %s).",
+                    self.classifier.model_type,
+                    self.classifier_type,
+                )
+            except Exception as ex:
+                logger.warning(
+                    "Could not initialize %s classifier (%s); defaulting to Chamfer competition without classifier.",
+                    self.classifier_type,
+                    ex,
+                )
+                self.classifier = None
 
         # Initialize Pinocchio & JointSpacePlanner if available
         if _HAS_PINOCCHIO:
@@ -306,18 +340,6 @@ class LatencyBenchmarkRunner:
         logger.info(f"Loading SAM model from {sam_path}...")
         self.seg_model = SegmentAnythingModel(str(sam_path))
 
-    def _determine_type_list(self, text: str) -> list[str]:
-        text_lower = text.lower()
-        for kw in self.cone_keywords:
-            if kw in text_lower:
-                if self.legacy_primitives:
-                    return ["01", "11", "12", "13", "14"]
-                return ["11", "13"]  # OBB and PCA Z=0 (pruned efficient topology set)
-        for kw in self.ellipsoid_keywords:
-            if kw in text_lower:
-                return ["2"]
-        return ["0"]
-
     def benchmark_session(self, sess: SessionData) -> TimingRecord:
         """Run single session benchmark with precision timing."""
         rec = TimingRecord(session_id=sess.session_id)
@@ -325,7 +347,7 @@ class LatencyBenchmarkRunner:
         # 1. Load inputs
         img_bgr = cv2.imread(str(sess.image_path)) if sess.image_path else None
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB) if img_bgr is not None else None
-        
+
         depth_map = None
         if sess.depth_path:
             depth_map = cv2.imread(str(sess.depth_path), cv2.IMREAD_UNCHANGED)
@@ -384,17 +406,46 @@ class LatencyBenchmarkRunner:
                 if len(pcd.points) > self.segmentation_max_points:
                     pcd = pcd.farthest_point_down_sample(self.segmentation_max_points)
                 pcd.orient_normals_towards_camera_location(self.normal_orientation_location)
-        
+
         if pcd is None or len(pcd.points) < 50:
             # Fallback to pre-saved pointcloud file
             if sess.pcd_path and sess.pcd_path.exists():
                 pcd = o3d.io.read_point_cloud(str(sess.pcd_path))
         rec.pointcloud_ms = (time.perf_counter() - t0) * 1000.0
 
-        # --- Stage 4: Multi-Primitive Competitive Fitting ---
+        # --- Stage 4: Geometric Shape Classification ---
+        pred_cat = None
+        if self.classifier is not None and self.classifier_type != "none" and pcd is not None and len(pcd.points) > 0:
+            cuda_sync()
+            t0 = time.perf_counter()
+            pred_cat = self.classifier.predict(pcd)
+            cuda_sync()
+            rec.classification_ms = (time.perf_counter() - t0) * 1000.0
+
+            if pred_cat == "0":
+                rec.predicted_type = "cuboid"
+                type_list = ["0"]
+            elif pred_cat == "1":
+                rec.predicted_type = "cone"
+                type_list = ["11", "13"] if not self.legacy_primitives else ["01", "11", "12", "13", "14"]
+            elif pred_cat == "2":
+                rec.predicted_type = "ellipsoid"
+                type_list = ["2"]
+            else:
+                rec.predicted_type = "cuboid"
+                type_list = ["0"]
+        else:
+            rec.classification_ms = 0.0
+            rec.predicted_type = "none"
+            # Without classifier: execute full multi-primitive Chamfer competitive fitting
+            if self.legacy_primitives:
+                type_list = ["0", "01", "1", "11", "12", "13", "14", "2"]
+            else:
+                type_list = ["0", "11", "13", "2"]
+
+        # --- Stage 5: Primitive Shape Fitting ---
         t0 = time.perf_counter()
-        type_list = self._determine_type_list(instruction)
-        best_cls = "0"
+        best_cls = type_list[0] if type_list else "0"
         best_params = None
         best_pcd_fit = None
         min_dist = float("inf")
@@ -445,7 +496,10 @@ class LatencyBenchmarkRunner:
         # Flag anomalous long tail (if execution takes > 15 seconds)
         if rec.fitting_ms > 15000.0:
             rec.is_long_tail = True
+
+        # --- Stage 6: Grasp Manifold Generation & Physical Filtering ---
         t0 = time.perf_counter()
+        ppose = []
         if best_params is not None:
             t_OC = best_params[-1]
             is_center = any(kw in instruction.lower() for kw in self.center_keywords)
@@ -484,7 +538,7 @@ class LatencyBenchmarkRunner:
                 ppose = check_pick_pose_for_2finger_gripper_range(pcd_model, ppose, self.finger_range)
         rec.grasp_ms = (time.perf_counter() - t0) * 1000.0
 
-        # --- Stage 6: Quintic Polynomial Trajectory Planning ---
+        # --- Stage 7: Quintic Polynomial Trajectory Planning ---
         t0 = time.perf_counter()
         q_start = np.array(self.cfg.get("robot", {}).get("start_pose", [0, 0, np.pi/2, 0, np.pi/2, 0]), dtype=np.float64)
         # Goal joint angle synthetic target (approx 45 degree rotation in joint 1-3)
@@ -500,10 +554,11 @@ class LatencyBenchmarkRunner:
             self._solve_quintic_analytical(q_start, q_goal, self.num_path_joints, self.path_time)
         rec.trajectory_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Compute total pipeline duration
+        # Compute total pipeline duration including classification
         rec.total_pipeline_ms = (
             rec.owlv2_ms + rec.sam_ms + rec.pointcloud_ms +
-            rec.fitting_ms + rec.grasp_ms + rec.trajectory_ms
+            rec.classification_ms + rec.fitting_ms +
+            rec.grasp_ms + rec.trajectory_ms
         )
         return rec
 
@@ -541,10 +596,14 @@ def _aggregate_stats(records: list[TimingRecord]) -> dict[str, dict[str, float]]
         ("owlv2", [r.owlv2_ms for r in records if r.owlv2_ms > 0]),
         ("sam", [r.sam_ms for r in records if r.sam_ms > 0]),
         ("pointcloud", [r.pointcloud_ms for r in records]),
+        ("classification", [r.classification_ms for r in records]),
         ("fitting", [r.fitting_ms for r in records]),
         ("grasp", [r.grasp_ms for r in records]),
         ("trajectory", [r.trajectory_ms for r in records]),
-        ("core_planning", [r.pointcloud_ms + r.fitting_ms + r.grasp_ms + r.trajectory_ms for r in records]),
+        ("core_planning", [
+            r.pointcloud_ms + r.classification_ms + r.fitting_ms + r.grasp_ms + r.trajectory_ms
+            for r in records
+        ]),
         ("total", [r.total_pipeline_ms for r in records]),
     ]
     stats: dict[str, dict[str, float]] = {}
@@ -583,70 +642,79 @@ def compute_statistics(records: list[TimingRecord]) -> dict[str, Any]:
     }
 
 
-def print_ascii_table(stats_dict: dict[str, Any], num_sessions: int, mode: str):
-    """Render terminal summary table with typical vs long-tail separation."""
+def print_ascii_table(stats_dict: dict[str, Any], num_sessions: int, mode: str, classifier: str = "mamba3d"):
+    """Render terminal summary table with modular stages including classification."""
     typ = stats_dict["typical"]
     tot_mean = typ["total"]["mean"] if typ["total"]["mean"] > 0 else 1.0
 
-    print("\n" + "=" * 94)
-    print(f"       LGGPF LATENCY BENCHMARK REPORT (Mode: {mode.upper()}, Total Sessions: {num_sessions})")
-    print("=" * 94)
-    print(f"{'Modular Stage':<34} | {'Mean ± Std (ms)':<18} | {'[Min, Max] (ms)':<16} | {'Share (%)':<10} | {'Count'}")
-    print("-" * 94)
+    cls_labels = {
+        "mamba3d": "Stage 4: Mamba3D Geometric Classification",
+        "pointnet2": "Stage 4: PointNet2 Geometric Classification",
+        "none": "Stage 4: Geometric Classification (None/Skipped)",
+    }
+    stage4_label = cls_labels.get(classifier.lower(), f"Stage 4: {classifier} Classification")
+
+    print("\n" + "=" * 96)
+    print(f"       LGGPF LATENCY BENCHMARK REPORT (Mode: {mode.upper()}, Classifier: {classifier.upper()}, Total: {num_sessions})")
+    print("=" * 96)
+    print(f"{'Modular Stage':<44} | {'Mean ± Std (ms)':<18} | {'[Min, Max] (ms)':<16} | {'Share (%)':<10} | {'Count'}")
+    print("-" * 96)
 
     # 1. Typical components
-    print(f"{'--- TYPICAL WORKLOAD (LONG-TAIL ISOLATED) ---':<94}")
+    print(f"{'--- TYPICAL WORKLOAD (LONG-TAIL ISOLATED) ---':<96}")
     typical_labels = [
-        ("owlv2", "1. OWLv2 Target Detection", typ["owlv2"]),
-        ("sam", "2. SAM Instance Segmentation", typ["sam"]),
-        ("pointcloud", "3. PointCloud Unprojection & SOR", typ["pointcloud"]),
-        ("grasp", "5. Pose Generation & Filtering", typ["grasp"]),
-        ("trajectory", "6. Quintic Trajectory Planning", typ["trajectory"]),
+        ("owlv2", "Stage 1: OWLv2 Target Detection", typ["owlv2"]),
+        ("sam", "Stage 2: SAM Instance Segmentation", typ["sam"]),
+        ("pointcloud", "Stage 3: PointCloud Back-Projection", typ["pointcloud"]),
+        ("classification", stage4_label, typ["classification"]),
+        ("fitting", "Stage 5: Shape Fitting", typ["fitting"]),
+        ("grasp", "Stage 6: Pose Generation & Filtering", typ["grasp"]),
+        ("trajectory", "Stage 7: Quintic Trajectory Planning", typ["trajectory"]),
     ]
 
     for key, label, s in typical_labels:
-        if s["count"] == 0:
-            print(f"{label:<34} | {'[SKIPPED / N/A]':<18} | {'-':<16} | {'-':<10} | 0")
+        if s["count"] == 0 or (key == "classification" and s["mean"] == 0.0 and classifier == "none"):
+            print(f"{label:<44} | {'[SKIPPED / N/A]':<18} | {'-':<16} | {'-':<10} | {s['count']}")
             continue
         mean_std = f"{s['mean']:6.1f} ± {s['std']:4.1f}"
         interval = f"[{s['min']:5.1f}, {s['max']:5.1f}]"
         share = (s["mean"] / tot_mean) * 100.0
-        print(f"{label:<34} | {mean_std:<18} | {interval:<16} | {share:6.1f}%    | {s['count']}")
+        print(f"{label:<44} | {mean_std:<18} | {interval:<16} | {share:6.1f}%    | {s['count']}")
 
     # 2. Primitive fitting breakdown
-    print("-" * 94)
-    print(f"{'--- PRIMITIVE COMPETITIVE FITTING BREAKDOWN ---':<94}")
+    print("-" * 96)
+    print(f"{'--- STAGE 5: PRIMITIVE FITTING BREAKDOWN BY CATEGORY ---':<96}")
     prim_rows = [
-        ("4a. Cuboid Analytic (Fast)", stats_dict["cuboid"]["fitting"]),
-        ("4b. Cone Multi-Topo Slicing", stats_dict["cone"]["fitting"]),
-        ("4c. Ellipsoid Analytic Fit", stats_dict["ellipsoid"]["fitting"]),
+        ("5a. Cuboid Analytic (Fast)", stats_dict["cuboid"]["fitting"]),
+        ("5b. Cone Multi-Topo Slicing", stats_dict["cone"]["fitting"]),
+        ("5c. Ellipsoid Analytic Fit", stats_dict["ellipsoid"]["fitting"]),
     ]
     for label, s in prim_rows:
         if s["count"] == 0:
             continue
         mean_std = f"{s['mean']:6.1f} ± {s['std']:4.1f}"
         interval = f"[{s['min']:5.1f}, {s['max']:5.1f}]"
-        print(f"{label:<34} | {mean_std:<18} | {interval:<16} | {'-':<10} | {s['count']}")
+        print(f"{label:<44} | {mean_std:<18} | {interval:<16} | {'-':<10} | {s['count']}")
 
-    print("-" * 94)
+    print("-" * 96)
     tot_typ = typ["total"]
     tot_mean_std = f"{tot_typ['mean']:6.1f} ± {tot_typ['std']:4.1f}"
     tot_interval = f"[{tot_typ['min']:5.1f}, {tot_typ['max']:5.1f}]"
-    print(f"{'TYPICAL PIPELINE TOTAL':<34} | {tot_mean_std:<18} | {tot_interval:<16} | 100.0%    | {tot_typ['count']}")
+    print(f"{'TYPICAL PIPELINE TOTAL':<44} | {tot_mean_std:<18} | {tot_interval:<16} | 100.0%    | {tot_typ['count']}")
 
     # 3. Anomalous Long-Tail
     tail = stats_dict["long_tail"]
     if tail["total"]["count"] > 0:
-        print("-" * 94)
-        print(f"{'--- ANOMALOUS LONG-TAIL WORKLOAD (ISOLATED) ---':<94}")
+        print("-" * 96)
+        print(f"{'--- ANOMALOUS LONG-TAIL WORKLOAD (ISOLATED) ---':<96}")
         for k, s in [("Anomalous Long-Tail", tail["total"])]:
             mean_std = f"{s['mean']:6.1f} ± {s['std']:4.1f}"
             interval = f"[{s['min']:5.1f}, {s['max']:5.1f}]"
-            print(f"{k:<34} | {mean_std:<18} | {interval:<16} | {'Unstable':<10} | {s['count']}")
-    print("=" * 94 + "\n")
+            print(f"{k:<44} | {mean_std:<18} | {interval:<16} | {'Unstable':<10} | {s['count']}")
+    print("=" * 96 + "\n")
 
 
-def generate_latex_table(stats_dict: dict[str, Any]) -> str:
+def generate_latex_table(stats_dict: dict[str, Any], classifier: str = "mamba3d") -> str:
     """Generate professional publication-ready LaTeX code for Table 5.4 in chapter5.tex."""
     typ = stats_dict["typical"]
     cuboid_fit = stats_dict["cuboid"]["fitting"]
@@ -656,6 +724,8 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
     owl = typ["owlv2"]
     sam = typ["sam"]
     pcd = typ["pointcloud"]
+    clf = typ["classification"]
+    fit_all = typ["fitting"]
     grp = typ["grasp"]
     trj = typ["trajectory"]
     tot_all = typ["total"]
@@ -664,10 +734,16 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
     def fmt_cell(s):
         if s["count"] == 0:
             return "N/A"
-        # 当标准差四舍五入退化为 0.0 时（如亚毫秒级五次多项式规划），自适应提升至两位小数，以符合计量规范并避免输出 \pm 0.0
         if round(s["std"], 1) == 0.0 and s["std"] > 0:
             return f"${s['mean']:.2f} \\pm {s['std']:.2f}$ (${s['min']:.2f}\\text{{--}}{s['max']:.2f}$)"
         return f"${s['mean']:.1f} \\pm {s['std']:.1f}$ (${s['min']:.1f}\\text{{--}}{s['max']:.1f}$)"
+
+    if classifier == "mamba3d":
+        cls_row = rf"Stage 4: Mamba3D 几何特征分类 & {fmt_cell(clf)} & $\mathcal{{O}}(N)$ & 双向状态空间模型选择性扫描（CUDA GPU 加速） \\"
+    elif classifier == "pointnet2":
+        cls_row = rf"Stage 4: PointNet2 几何特征分类 & {fmt_cell(clf)} & $\mathcal{{O}}(N \log N)$ & 多尺度分组分层点云特征提取与分类 \\"
+    else:
+        cls_row = rf"Stage 4: 几何特征分类 (无/跳过) & {fmt_cell(clf)} & -- & 全基元 Chamfer 竞争匹配模式 \\"
 
     latex = rf"""\begin{{table}}[htbp]
         \centering
@@ -675,7 +751,7 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
         \label{{tab:ch5_runtime}}
         \zihao{{5}}
         \setlength{{\tabcolsep}}{{4.5pt}}
-        \begin{{tabular}}{{p{{3.0cm}} c c p{{5.0cm}}}}
+        \begin{{tabular}}{{p{{3.2cm}} c c p{{4.8cm}}}}
                 \toprule
                 功能子模块阶段 & 实测运行耗时 (ms) & 时间复杂度 & 核心计算开销与硬件资源说明 \\
                 \midrule
@@ -686,15 +762,17 @@ def generate_latex_table(stats_dict: dict[str, Any]) -> str:
                 \midrule
                 \multicolumn{{4}}{{l}}{{\textbf{{第二部分：LGGPF 核心几何抓取规划流水线（本文核心算法贡献）}}}} \\
                 \midrule
-                点云针孔逆投影与滤波     & {fmt_cell(pcd)} & $\mathcal{{O}}(N \log N)$                           & 像元透视逆变换与 KD-Tree 离群点统计滤除 \\
-                长方体基元快速拟合       & {fmt_cell(cuboid_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 单模型解析平面法向与 OBB 几何尺寸解算 \\
-                圆锥台多拓扑竞争拟合     & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{topo}}}} K_{{\mathrm{{cir}}}} N)$ & 遍历切片圆代数拟合、母线回归与双向 Chamfer 距离计算 \\
-                椭球体闭式解析特征拟合   & {fmt_cell(ellip_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot 3^3)$      & 实对称矩阵闭式特征值分解与向量化 RANSAC \\
-                候选位姿生成与物理过滤   & {fmt_cell(grp)} & $\mathcal{{O}}(N_{{\mathrm{{cand}}}})$                   & 几何限位、解析 IK 可达性与 Coal 碰撞干涉检测 \\
-                五次多项式平滑轨迹规划   & {fmt_cell(trj)} & $\mathcal{{O}}(N_{{\mathrm{{joints}}}} \cdot 6)$         & 闭式多项式矩阵求逆（式\eqref{{eq:ch5_quintic_sol}}）与路径离散采样 \\
+                Stage 3: 点云逆投影与滤波 & {fmt_cell(pcd)} & $\mathcal{{O}}(N \log N)$                           & 像元透视逆变换与 KD-Tree 离群点统计滤除 \\
+                {cls_row}
+                Stage 5: Shape Fitting  & {fmt_cell(fit_all)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 基于神经分类导向的单几何基元解析与 RANSAC 鲁棒拟合 \\
+                \quad 长方体基元快速拟合 & {fmt_cell(cuboid_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot N)$        & 单模型解析平面法向与 OBB 几何尺寸解算 \\
+                \quad 圆锥台多拓扑拟合   & {fmt_cell(cone_fit)} & $\mathcal{{O}}(M_{{\mathrm{{topo}}}} K_{{\mathrm{{cir}}}} N)$ & 遍历切片圆代数拟合与母线回归（剪枝拓扑集） \\
+                \quad 椭球体解析特征拟合 & {fmt_cell(ellip_fit)} & $\mathcal{{O}}(K_{{\mathrm{{ransac}}}} \cdot 3^3)$      & 实对称矩阵闭式特征值分解与向量化 RANSAC \\
+                Stage 6: 候选位姿生成与过滤 & {fmt_cell(grp)} & $\mathcal{{O}}(N_{{\mathrm{{cand}}}})$                   & 几何限位、解析 IK 可达性与 Coal 碰撞干涉检测 \\
+                Stage 7: 五次多项式轨迹规划 & {fmt_cell(trj)} & $\mathcal{{O}}(N_{{\mathrm{{joints}}}} \cdot 6)$         & 闭式多项式矩阵求逆（式\eqref{{eq:ch5_quintic_sol}}）与路径离散采样 \\
                 \midrule
-				\textbf{{核心抓取规划层耗时（全类别）}} & \textbf{{{fmt_cell(core_all)}}} & -- & \textbf{{12次单物体记录的跨类别统计}} \\
-				\textbf{{端到端系统级总耗时（全类别）}} & \textbf{{{fmt_cell(tot_all)}}} & -- & \textbf{{含视觉前端、点云、拟合、抓取与轨迹阶段}} \\
+				\textbf{{核心抓取规划层耗时（全类别）}} & \textbf{{{fmt_cell(core_all)}}} & -- & \textbf{{含点云、分类、拟合、抓取与轨迹规划阶段}} \\
+				\textbf{{端到端系统级总耗时（全类别）}} & \textbf{{{fmt_cell(tot_all)}}} & -- & \textbf{{含视觉前端、点云、分类、拟合、抓取与轨迹阶段}} \\
                 \bottomrule
         \end{{tabular}}
 \end{{table}}"""
@@ -718,6 +796,10 @@ def main():
                         help="Run across all available subsets: single, multi, position.")
     parser.add_argument("--mode", choices=["auto", "full", "geometry"], default="auto",
                         help="Benchmark mode: full (neural net + geometry), geometry (skip heavy weights), auto.")
+    parser.add_argument("--classifier", choices=["mamba3d", "pointnet2", "none"], default="mamba3d",
+                        help="Geometric shape classifier backend (mamba3d, pointnet2, none). Default: mamba3d.")
+    parser.add_argument("--checkpoint", type=Path, default=None,
+                        help="Optional custom checkpoint weights path for the classifier.")
     parser.add_argument("--warmup", type=int, default=2,
                         help="Number of initial warmup iterations to discard JIT/disk cache anomalies.")
     parser.add_argument("--legacy-primitives", action="store_true",
@@ -742,7 +824,13 @@ def main():
         sys.exit(1)
 
     logger.info(f"Discovered {len(sessions)} sessions across subsets {subsets}.")
-    runner = LatencyBenchmarkRunner(args.config, mode=args.mode, legacy_primitives=args.legacy_primitives)
+    runner = LatencyBenchmarkRunner(
+        args.config,
+        mode=args.mode,
+        legacy_primitives=args.legacy_primitives,
+        classifier=args.classifier,
+        checkpoint=args.checkpoint,
+    )
 
     # Warmup
     if args.warmup > 0 and len(sessions) > 0:
@@ -777,9 +865,9 @@ def main():
                 logger.warning(f"Visualization failed for {sess.session_id}: {e}")
 
     stats = compute_statistics(records)
-    print_ascii_table(stats, len(records), runner.active_mode)
+    print_ascii_table(stats, len(records), runner.active_mode, runner.classifier_type)
 
-    latex_code = generate_latex_table(stats)
+    latex_code = generate_latex_table(stats, runner.classifier_type)
     print("\n% ===== GENERATED LATEX SNIPPET FOR TABLE 5.4 =====\n")
     print(latex_code)
     print("\n% =================================================\n")
@@ -788,6 +876,7 @@ def main():
     output_dict = {
         "metadata": {
             "mode": runner.active_mode,
+            "classifier": runner.classifier_type,
             "subsets": subsets,
             "sample_count": len(records),
             "typical_count": len([r for r in records if not r.is_long_tail]),

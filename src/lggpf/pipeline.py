@@ -33,7 +33,7 @@ from .config import load_config, get_calibration_matrices, get_camera_intrinsics
 from .camera import CameraController
 from .detection import VisionLanguageOwlVit
 from .segmentation import SegmentAnythingModel
-from .shape_fitting import FittingByBGS, PcdClassification
+from .shape_fitting import FittingByBGS, ShapeClassifier
 from .grasp import PickPose
 from .robot import Robot, JointSpacePlanner
 from .robot.communicator import RobotArmController
@@ -98,10 +98,8 @@ class GraspingPipeline:
         self.velocity_limits = traj_cfg.get("velocity_limits", None)
         self.acceleration_limits = traj_cfg.get("acceleration_limits", None)
 
-        # Language type-selection keywords
+        # Language grasp strategy keywords
         lang_cfg = pipe_cfg.get("language_type_map", {})
-        self.cone_keywords = lang_cfg.get("cone_keywords", ["cup", "bowl", "tube"])
-        self.ellipsoid_keywords = lang_cfg.get("ellipsoid_keywords", ["ball"])
         self.center_keywords = lang_cfg.get("center_keywords", ["center"])
         self.side_keywords = lang_cfg.get("side_keywords", ["side"])
 
@@ -186,9 +184,13 @@ class GraspingPipeline:
         # Segmentation
         self.models["segmentation"] = SegmentAnythingModel(model_cfg.get("sam", ""))
 
-        # Point cloud classification (PointNet2)
-        self.models["classification"] = PcdClassification(
-            model_cfg.get("pointnet2", "")
+        # Point cloud classification (Mamba3D / PointNet2)
+        classifier_type = model_cfg.get("classifier_type", "mamba3d")
+        classifier_ckpt = model_cfg.get(classifier_type, model_cfg.get("pointnet2", ""))
+        self.models["classification"] = ShapeClassifier(
+            model_type=classifier_type,
+            checkpoint_path=classifier_ckpt or None,
+            normal_orientation=self.normal_orientation_location,
         )
 
         # Shape fitting
@@ -416,29 +418,12 @@ class GraspingPipeline:
     # 6. Classify and fit shape
     # =========================================================================
 
-    def _determine_type_list(self) -> list[str]:
-        """Determine candidate fitting types from the instruction text.
-
-        Uses language-guided keyword matching:
-        - "cup"/"bowl"/"tube" -> cone types ["01", "11", "12", "13", "14"]
-        - "ball" -> ellipsoid ["2"]
-        - else -> cuboid ["0"]
-        """
-        text = self.data.get("text", "").lower()
-        for kw in self.cone_keywords:
-            if kw in text:
-                return ["01", "11", "12", "13", "14"]
-        for kw in self.ellipsoid_keywords:
-            if kw in text:
-                return ["2"]
-        return ["0"]
-
     def classify_and_fit(self) -> dict[str, Any]:
-        """Run brute-force shape fitting and select the best match.
+        """Classify segmented point cloud with ShapeClassifier and fit shape primitive.
 
-        Tries all candidate fitting types (determined by language keywords),
-        generates synthetic point clouds for each, and selects the one with
-        the lowest mean bidirectional point cloud distance.
+        Replaces language keyword matching with neural network geometric
+        classification (Mamba3D / PointNet2). Based on the predicted category,
+        executes targeted high-precision primitive fitting.
 
         Returns:
             Dict with keys: ``category``, ``params`` (doubled sizes), and
@@ -446,7 +431,23 @@ class GraspingPipeline:
         """
         fbg = self.models["fitting"]
         pcd = self.data["pcd"]
-        type_list = self._determine_type_list()
+        classifier = self.models["classification"]
+
+        # 1. Neural geometric classification (Mamba3D / PointNet2)
+        pred_cat = classifier.predict(pcd)
+        self.data["predicted_category"] = pred_cat
+        logger.info("Neural classifier predicted shape primitive: %s", pred_cat)
+
+        # 2. Targeted candidate fitting topologies for the predicted category
+        if pred_cat == "0":
+            type_list = ["0"]
+        elif pred_cat == "1":
+            type_list = ["11", "13"]
+        elif pred_cat == "2":
+            type_list = ["2"]
+        else:
+            type_list = ["0"]
+
         total_points = self.fitting_synthetic_points
 
         params_list: list[Any] = []

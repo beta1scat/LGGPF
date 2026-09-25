@@ -67,7 +67,7 @@ try:
         filter_pose_by_axis_diff,
         check_pick_pose_for_2finger_gripper_range,
     )
-    from lggpf.shape_fitting import FittingByBGS
+    from lggpf.shape_fitting import FittingByBGS, ShapeClassifier
     from lggpf.grasp import PickPose
 except ImportError as e:
     sys.exit(f"[ERROR] Failed to import lggpf core modules: {e}")
@@ -119,8 +119,6 @@ class PipelineVisualizer:
         self.path_time = traj_cfg.get("path_time", 3.0)
 
         lang_cfg = pipe_cfg.get("language_type_map", {})
-        self.cone_keywords = lang_cfg.get("cone_keywords", ["cup", "bowl", "tube"])
-        self.ellipsoid_keywords = lang_cfg.get("ellipsoid_keywords", ["ball"])
         self.center_keywords = lang_cfg.get("center_keywords", ["center"])
         self.side_keywords = lang_cfg.get("side_keywords", ["side"])
 
@@ -134,6 +132,15 @@ class PipelineVisualizer:
         self.fbg = FittingByBGS()
 
         model_cfg = self.cfg.get("models", {})
+        classifier_type = model_cfg.get("classifier_type", "mamba3d")
+        classifier_ckpt = model_cfg.get(classifier_type, model_cfg.get("pointnet2", ""))
+        self.classifier = ShapeClassifier(
+            model_type=classifier_type,
+            checkpoint_path=classifier_ckpt or None,
+            normal_orientation=self.normal_orientation_location,
+        )
+        logger.info("Initialized ShapeClassifier (%s) for pipeline visualization.", classifier_type)
+
         owl_raw = Path(model_cfg.get("owlv2", ""))
         sam_raw = Path(model_cfg.get("sam", ""))
 
@@ -169,18 +176,6 @@ class PipelineVisualizer:
         else:
             logger.info("Operating in geometry mode using offline inputs.")
             self.active_mode = "geometry"
-
-    def _determine_type_list(self, text: str) -> list[str]:
-        text_lower = text.lower()
-        for kw in self.cone_keywords:
-            if kw in text_lower:
-                if self.legacy_primitives:
-                    return ["01", "11", "12", "13", "14"]
-                return ["11", "13"]
-        for kw in self.ellipsoid_keywords:
-            if kw in text_lower:
-                return ["2"]
-        return ["0"]
 
     # =========================================================================
     # Pipeline Execution
@@ -309,8 +304,16 @@ class PipelineVisualizer:
                 pcd.orient_normals_towards_camera_location(self.normal_orientation_location)
         data["pcd"] = pcd
 
-        # --- Stage 4: Multi-Primitive Competitive Fitting ---
-        type_list = self._determine_type_list(instruction)
+        # --- Stage 4: Neural Geometric Shape Classification & Fitting ---
+        pred_cat = self.classifier.predict(pcd) if (self.classifier and pcd and len(pcd.points) > 0) else "0"
+        if pred_cat == "0":
+            type_list = ["0"]
+        elif pred_cat == "1":
+            type_list = ["11", "13"] if not self.legacy_primitives else ["01", "11", "12", "13", "14"]
+        elif pred_cat == "2":
+            type_list = ["2"]
+        else:
+            type_list = ["0"]
         best_cls = "0"
         best_params = None
         best_pcd_fit = None
