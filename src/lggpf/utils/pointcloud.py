@@ -123,6 +123,109 @@ def ransac(data, model, n, k, t, d, inliers_ratio=0.5, debug=False, return_all=F
         return bestfit
 
 
+def segment_plane_with_normals(
+    points: np.ndarray,
+    normals: np.ndarray,
+    dist_threshold: float = 0.005,
+    angle_threshold_deg: float = 15.0,
+    max_iterations: int = 1500,
+    min_inliers: int = 25,
+    seed: int = 42,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """Segment a planar patch from 3D points using joint distance and normal consistency RANSAC.
+
+    A point (p_i, n_i) is considered an inlier to plane (n, d) if:
+        1. |n^T p_i + d| <= dist_threshold
+        2. |n_i^T n| >= cos(angle_threshold_deg)
+
+    Args:
+        points: (N, 3) point array.
+        normals: (N, 3) unit normal vector array.
+        dist_threshold: Maximum point-to-plane distance in meters (default 0.005 = 5mm).
+        angle_threshold_deg: Maximum angular deviation in degrees between point normal and plane normal (default 15 deg).
+        max_iterations: Number of RANSAC sampling iterations.
+        min_inliers: Minimum inliers required to declare a valid plane.
+        seed: Random seed for deterministic reproducibility.
+
+    Returns:
+        Tuple of (plane_model, inlier_indices), where plane_model is [a, b, c, d] such that a^2+b^2+c^2=1.
+        Returns (None, empty_array) if no valid plane is found.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    normals = np.asarray(normals, dtype=np.float64)
+    n_pts = len(points)
+    if n_pts < 3 or len(normals) != n_pts:
+        return None, np.empty(0, dtype=int)
+
+    # Normalize normals if not already unit length
+    n_mags = np.linalg.norm(normals, axis=1, keepdims=True)
+    valid_normals = (n_mags[:, 0] > 1e-4)
+    normals_unit = np.where(valid_normals[:, None], normals / np.maximum(n_mags, 1e-12), normals)
+
+    cos_thresh = float(np.cos(np.deg2rad(angle_threshold_deg)))
+    best_inliers = np.empty(0, dtype=int)
+    best_plane = None
+
+    rng = np.random.default_rng(seed)
+
+    for _ in range(max_iterations):
+        sample_idx = rng.choice(n_pts, size=3, replace=False)
+        p1, p2, p3 = points[sample_idx]
+
+        # Candidate plane normal from 3 sampled points
+        v12 = p2 - p1
+        v13 = p3 - p1
+        n = np.cross(v12, v13)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-6:
+            continue
+        n /= n_len
+
+        # Fast rejection: sampled points themselves must have surface normals aligned with candidate plane normal
+        if np.any(np.abs(normals_unit[sample_idx] @ n) < cos_thresh):
+            continue
+
+        d = -float(np.dot(n, p1))
+
+        # Check distance and normal consistency
+        dist = np.abs(points @ n + d)
+        normal_align = np.abs(normals_unit @ n)
+        inlier_mask = (dist <= dist_threshold) & (normal_align >= cos_thresh)
+
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        if inlier_count > len(best_inliers):
+            best_inliers = np.flatnonzero(inlier_mask)
+            best_plane = np.array([n[0], n[1], n[2], d], dtype=np.float64)
+
+    if len(best_inliers) < min_inliers:
+        return None, np.empty(0, dtype=int)
+
+    # Refine plane model via SVD on all inlier points
+    p_in = points[best_inliers]
+    c = np.mean(p_in, axis=0)
+    _, _, vh = np.linalg.svd(p_in - c)
+    n_refined = vh[2, :]
+    n_refined /= np.linalg.norm(n_refined)
+
+    # Orient refined normal to be consistent with majority of inlier normals
+    mean_in_n = np.mean(normals_unit[best_inliers], axis=0)
+    if np.dot(n_refined, mean_in_n) < 0:
+        n_refined = -n_refined
+
+    d_refined = -float(np.dot(n_refined, c))
+
+    # Re-evaluate inliers with refined model
+    dist = np.abs(points @ n_refined + d_refined)
+    normal_align = np.abs(normals_unit @ n_refined)
+    final_inlier_mask = (dist <= dist_threshold) & (normal_align >= cos_thresh)
+    final_inliers = np.flatnonzero(final_inlier_mask)
+    if len(final_inliers) >= min_inliers:
+        best_inliers = final_inliers
+
+    best_plane = np.array([n_refined[0], n_refined[1], n_refined[2], d_refined], dtype=np.float64)
+    return best_plane, best_inliers
+
+
 # =============================================================================
 # Least-squares model classes for RANSAC
 # =============================================================================
@@ -140,23 +243,26 @@ def fit_circle_kasa(points):
     Returns:
         Tuple of (center, radius) where center is (2,) np.ndarray, or None.
     """
-    pts = np.asarray(points)
+    pts = np.asarray(points, dtype=np.float64)
     if len(pts) < 4:
         return None
-    x = pts[:, 0]
-    y = pts[:, 1]
-    A = np.column_stack([x, y, np.ones_like(x)])
-    b = x**2 + y**2
+    mean_pt = np.mean(pts, axis=0)
+    u = pts[:, 0] - mean_pt[0]
+    v = pts[:, 1] - mean_pt[1]
+    A = np.column_stack([u, v, np.ones_like(u)])
+    b = u**2 + v**2
     try:
         sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        xc = float(sol[0] / 2.0)
-        yc = float(sol[1] / 2.0)
-        rad_sq = float(sol[2] + xc**2 + yc**2)
+        uc = float(sol[0] / 2.0)
+        vc = float(sol[1] / 2.0)
+        rad_sq = float(sol[2] + uc**2 + vc**2)
         if rad_sq <= 0 or np.isnan(rad_sq):
             return None
         r = float(np.sqrt(rad_sq))
         if np.isnan(r) or np.isinf(r) or r <= 0:
             return None
+        xc = uc + mean_pt[0]
+        yc = vc + mean_pt[1]
         return np.array([xc, yc]), r
     except Exception:
         return None

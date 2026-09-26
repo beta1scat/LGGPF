@@ -9,7 +9,7 @@ Implements fitting of three primitive types to 3D point clouds:
 Each fitting function returns shape parameters and a rigid transform (SE3)
 that maps the canonical shape frame to the world frame.
 
-Merged from the original ``shape_fitting_bgs.py`` and ``fit_bgspcd_noros.py``.
+Strictly aligned with the doctoral thesis (Chapters 4 & 5) and code/GPBSF.
 """
 
 import numpy as np
@@ -17,26 +17,21 @@ import open3d as o3d
 from scipy.optimize import least_squares, nnls
 from scipy.spatial.transform import Rotation
 from spatialmath import SO3, SE3
-from sklearn import linear_model
-from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.linear_model import RANSACRegressor, LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.pipeline import make_pipeline
+from sklearn import linear_model
+from sklearn.linear_model import LinearRegression, RANSACRegressor
 
 from ..utils.pointcloud import (
-    CircleLeastSquaresModel,
     ConeAxisLeastSquaresModel,
     EllipsoidLeastSquaresModel,
     NormalLeastSquaresModel,
     ransac,
-    fit_circle,
     fit_circle_kasa,
-    find_orthogonal_vectors,
     pc_normalize,
     generate_cone_points,
     generate_ellipsoid_points,
     compute_trimmed_distance,
+    segment_plane_with_normals,
 )
 
 
@@ -92,10 +87,11 @@ def _safe_se3(R, t):
 
 
 def _oriented_bounding_box(pcd):
-    """Return the oriented bounding box using PCA.
+    """Return the tightest OBB supported by the installed Open3D build.
 
     Prefers get_oriented_bounding_box() (covariance-based PCA, ~0.5 ms) over
     get_minimal_oriented_bounding_box() (3D rotating calipers combinatorial search, 100+ ms).
+    Falls back gracefully if one is unavailable.
     """
     oriented = getattr(pcd, "get_oriented_bounding_box", None)
     if oriented is not None:
@@ -145,148 +141,54 @@ def get_plane_axis(point_cloud, half_dim):
     return np.argmax(dist_sum_list)
 
 
-def get_max_num_cluster(pcd, eps=0.1, min_points=10, print_progress=True):
-    """Extract the largest DBSCAN cluster from a point cloud.
+def _get_obb_radii(pts, half_dim, plane_axis):
+    """Estimate top and bottom cross-sectional radii for OBB cone fitting.
 
-    Args:
-        pcd: Open3D point cloud.
-        eps: DBSCAN neighborhood radius.
-        min_points: Minimum cluster size.
-        print_progress: Show DBSCAN progress.
-
-    Returns:
-        Open3D point cloud of the largest cluster.
-    """
-    labels = np.array(
-        pcd.cluster_dbscan(
-            eps=eps, min_points=min_points, print_progress=print_progress
-        )
-    )
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    max_cluster_label = unique_labels[np.argmax(counts)]
-    max_cluster_indices = np.where(labels == max_cluster_label)[0]
-    return pcd.select_by_index(max_cluster_indices)
-
-
-def _get_adjust_transform(pts, num_points, half_dim, plane_axis, pcd):
-    """Compute a correction transform for OBB-based cone fitting.
-
-    Fits circles to the top and bottom cross-sections and adjusts the
-    coordinate frame to align with the cone axis.
-
-    Args:
-        pts: (N, 3) point array.
-        num_points: Number of points.
-        half_dim: Half-extents of the bounding box.
-        plane_axis: Index of the symmetry axis.
-        pcd: Open3D point cloud.
-
-    Returns:
-        Tuple of (T, top_r, bottom_r).
+    Uses fast algebraic Kåsa circle fitting on slice points, falling back to
+    bounding box half-extents.
     """
     idx1, idx2 = [i for i in range(3) if i != plane_axis]
+    num_points = len(pts)
 
-    # Select top and bottom slices
-    top_idx = [
-        i for i in range(num_points) if pts[i][plane_axis] > 0.9 * half_dim[plane_axis]
-    ]
-    if len(top_idx) < 500:
-        top_idx = np.argsort(pts[:, plane_axis])[-500:]
-    bottom_idx = [
-        i for i in range(num_points) if pts[i][plane_axis] < -0.9 * half_dim[plane_axis]
-    ]
-    if len(bottom_idx) < 500:
-        bottom_idx = np.argsort(pts[:, plane_axis])[:500]
-
-    top_pcd = pcd.select_by_index(top_idx)
-    top_pts = np.asarray(top_pcd.points)
-    bottom_pcd = pcd.select_by_index(bottom_idx)
-    bottom_pts = np.asarray(bottom_pcd.points)
-
-    # Fit circles on top and bottom slices
-    top_cluster_pcd = get_max_num_cluster(top_pcd, 0.1, 10, True)
-    top_cluster_pts = np.asarray(top_cluster_pcd.points)
-    bottom_cluster_pcd = get_max_num_cluster(bottom_pcd, 0.1, 10, True)
-    bottom_cluster_pts = np.asarray(bottom_cluster_pcd.points)
-
-    top_circle, _, _ = fit_circle(top_cluster_pts[:, [idx1, idx2]], 1000, 0.01)
-    bottom_circle, _, _ = fit_circle(bottom_cluster_pts[:, [idx1, idx2]], 1000, 0.01)
-
-    # Determine slice size ratios
-    top_size_1 = abs(np.max(top_pts[:, idx1]) - np.min(top_pts[:, idx1]))
-    top_size_2 = abs(np.max(top_pts[:, idx2]) - np.min(top_pts[:, idx2]))
-    top_size_ratio = (
-        top_size_1 / top_size_2 if top_size_1 < top_size_2 else top_size_2 / top_size_1
-    )
-    top_ratio_1 = top_size_1 / (2 * half_dim[idx1])
-    top_ratio_2 = top_size_2 / (2 * half_dim[idx2])
-
-    bottom_size_1 = abs(np.max(bottom_pts[:, idx1]) - np.min(bottom_pts[:, idx1]))
-    bottom_size_2 = abs(np.max(bottom_pts[:, idx2]) - np.min(bottom_pts[:, idx2]))
-    bottom_ratio_1 = bottom_size_1 / (2 * half_dim[idx1])
-    bottom_ratio_2 = bottom_size_2 / (2 * half_dim[idx2])
-
-    # Use fitted circle centers
-    center_top = top_circle[0]
-    center_bottom = bottom_circle[0]
-
-    top_center = [0, 0, 0]
-    top_center[plane_axis] = half_dim[plane_axis]
-    top_center[idx1] = center_top[0]
-    top_center[idx2] = center_top[1]
-
-    bottom_center = [0, 0, 0]
-    bottom_center[plane_axis] = -1.0 * half_dim[plane_axis]
-    bottom_center[idx1] = center_bottom[0]
-    bottom_center[idx2] = center_bottom[1]
-
-    # Build correction transform
-    if (
-        abs(top_ratio_1 / top_ratio_2 - 1) < 0.01
-        and abs(bottom_ratio_1 / bottom_ratio_2 - 1) < 0.01
-    ):
-        T = SE3.Tx(0)
+    top_mask = pts[:, plane_axis] > 0.85 * half_dim[plane_axis]
+    if np.count_nonzero(top_mask) < 20:
+        top_idx = np.argsort(pts[:, plane_axis])[-min(500, num_points):]
     else:
-        v1 = np.asarray(top_center) - np.asarray(bottom_center)
-        v1 = v1 / np.linalg.norm(v1)
-        v2, v3 = find_orthogonal_vectors(v1)
-        mid = 0.5 * (np.asarray(top_center) + np.asarray(bottom_center))
-        if plane_axis == 0:
-            T = SE3.Rt(SO3.TwoVectors(x=v1, y=v2), mid)
-        elif plane_axis == 1:
-            T = SE3.Rt(SO3.TwoVectors(x=v2, y=v1), mid)
-        else:
-            T = SE3.Rt(SO3.TwoVectors(x=v2, z=v1), mid)
+        top_idx = np.flatnonzero(top_mask)
 
-    # Compute radii from circle fits
-    top_circle_r = max(
-        np.linalg.norm(
-            top_pts[:, [idx1, idx2]] - np.array(top_circle[0]), ord=2, axis=1
-        )
-    )
-    bottom_circle_r = max(
-        np.linalg.norm(
-            bottom_pts[:, [idx1, idx2]] - np.array(bottom_circle[0]), ord=2, axis=1
-        )
-    )
-
-    max_half = max(half_dim)
-    if (
-        top_circle_r > max(top_size_1, top_size_2) / 2
-        and top_circle[1] < max_half * 1.2
-    ):
-        top_r = top_circle_r
+    bottom_mask = pts[:, plane_axis] < -0.85 * half_dim[plane_axis]
+    if np.count_nonzero(bottom_mask) < 20:
+        bottom_idx = np.argsort(pts[:, plane_axis])[:min(500, num_points)]
     else:
-        top_r = max(top_size_1, top_size_2) / 2
-    if (
-        bottom_circle_r > max(bottom_size_1, bottom_size_2) / 2
-        and bottom_circle[1] < max_half * 1.2
-    ):
-        bottom_r = bottom_circle_r
-    else:
-        bottom_r = max(bottom_size_1, bottom_size_2) / 2
+        bottom_idx = np.flatnonzero(bottom_mask)
 
-    return T, top_r, bottom_r
+    top_pts = pts[top_idx][:, [idx1, idx2]]
+    bottom_pts = pts[bottom_idx][:, [idx1, idx2]]
+
+    # Top radius
+    top_r = None
+    if len(top_pts) >= 4:
+        kasa_res = fit_circle_kasa(top_pts)
+        if kasa_res is not None and kasa_res[1] > 1e-4:
+            top_r = kasa_res[1]
+    if top_r is None:
+        top_size = np.ptp(top_pts, axis=0) if len(top_pts) > 0 else np.array([half_dim[idx1] * 2, half_dim[idx2] * 2])
+        top_r = float(np.mean(top_size)) / 2.0
+
+    # Bottom radius
+    bottom_r = None
+    if len(bottom_pts) >= 4:
+        kasa_res = fit_circle_kasa(bottom_pts)
+        if kasa_res is not None and kasa_res[1] > 1e-4:
+            bottom_r = kasa_res[1]
+    if bottom_r is None:
+        bottom_size = np.ptp(bottom_pts, axis=0) if len(bottom_pts) > 0 else np.array([half_dim[idx1] * 2, half_dim[idx2] * 2])
+        bottom_r = float(np.mean(bottom_size)) / 2.0
+
+    max_allowed_r = max(half_dim) * 2.0
+    top_r = min(max(float(top_r), 1e-4), max_allowed_r)
+    bottom_r = min(max(float(bottom_r), 1e-4), max_allowed_r)
+    return top_r, bottom_r
 
 
 # =============================================================================
@@ -297,7 +199,8 @@ def _get_adjust_transform(pts, num_points, half_dim, plane_axis, pcd):
 def fit_frustum_cone_by_slice_linear(points, num_layers=10, pcd=None, is_debug=False):
     """Estimate cone radii by slicing along the Z axis and fitting circles per layer.
 
-    Uses RANSAC linear regression on per-layer radii to get top/bottom radius.
+    Uses two-point line enumeration and inlier linear least-squares regression strictly
+    following thesis Section 4.3.2 Eq. (4.5).
 
     Args:
         points: (N, 3) point array (already aligned so Z is the cone axis).
@@ -350,7 +253,7 @@ def fit_frustum_cone_by_slice_linear(points, num_layers=10, pcd=None, is_debug=F
 
     if len(layer_radius) < max(3, int(np.ceil(0.3 * num_layers))):
         # A partial camera view can leave too few slices for independent
-        # circle fits.  Estimate a conservative circular profile rather than
+        # circle fits. Estimate a conservative circular profile rather than
         # returning None and letting the dispatcher count a Python error as a
         # geometric fitting failure.
         center_xy = np.median(points[:, :2], axis=0)
@@ -368,133 +271,67 @@ def fit_frustum_cone_by_slice_linear(points, num_layers=10, pcd=None, is_debug=F
             center_xy[0], center_xy[1], (z_min + z_max) / 2,
         ])
 
-    # Fast vectorized RANSAC linear regression on layer radii (N <= 12 points)
-    x_pts = np.array(list(layer_radius.keys()), dtype=np.float64)
-    y_pts = np.array(list(layer_radius.values()), dtype=np.float64)
-    n_pts = len(x_pts)
+    # Two-point line enumeration and inlier refinement strictly following thesis Section 4.3.2 Eq. (4.5)
+    layer_indices = np.array(list(layer_radius.keys()), dtype=np.int32)
+    radii = np.array(list(layer_radius.values()), dtype=np.float64)
+    n_valid = len(layer_indices)
 
-    if n_pts >= 2:
-        i_idx, j_idx = np.triu_indices(n_pts, k=1)
-        dx = x_pts[j_idx] - x_pts[i_idx]
-        valid = np.abs(dx) > 1e-4
-        if np.any(valid):
-            slopes = (y_pts[j_idx[valid]] - y_pts[i_idx[valid]]) / dx[valid]
-            intercepts = y_pts[i_idx[valid]] - slopes * x_pts[i_idx[valid]]
-            preds = slopes[:, None] * x_pts[None, :] + intercepts[:, None]
-            resids = np.abs(preds - y_pts[None, :])
-            thresh = max(0.15 * float(np.ptp(y_pts)), 1e-3)
-            inlier_counts = np.sum(resids <= thresh, axis=1)
-            best_pair = int(np.argmax(inlier_counts))
-            inlier_mask = np.flatnonzero(resids[best_pair] <= thresh)
-            if len(inlier_mask) >= 2:
-                A = np.column_stack((x_pts[inlier_mask], np.ones(len(inlier_mask))))
-                sol, _, _, _ = np.linalg.lstsq(A, y_pts[inlier_mask], rcond=None)
-                slope, intercept = sol[0], sol[1]
-            else:
-                slope, intercept = slopes[best_pair], intercepts[best_pair]
-        else:
-            slope, intercept = 0.0, float(np.mean(y_pts))
-            inlier_mask = np.arange(n_pts)
+    r_min_val, r_max_val = float(np.min(radii)), float(np.max(radii))
+    res_threshold = max(0.15 * (r_max_val - r_min_val), 0.001)
+
+    best_inlier_mask = None
+    best_inlier_count = -1
+    best_res_sum = float("inf")
+
+    # Enumerate all pairs of valid slices to generate candidate lines
+    for i in range(n_valid):
+        for j in range(i + 1, n_valid):
+            dx = float(layer_indices[j] - layer_indices[i])
+            if abs(dx) < 1e-6:
+                continue
+            dy = float(radii[j] - radii[i])
+            a_cand = dy / dx
+            b_cand = radii[i] - a_cand * layer_indices[i]
+
+            pred_r = a_cand * layer_indices + b_cand
+            res = np.abs(radii - pred_r)
+            inlier_mask = res <= res_threshold
+            inlier_count = int(np.count_nonzero(inlier_mask))
+            res_sum = float(np.sum(res[inlier_mask])) if inlier_count > 0 else 0.0
+
+            if inlier_count > best_inlier_count or (inlier_count == best_inlier_count and res_sum < best_res_sum):
+                best_inlier_count = inlier_count
+                best_inlier_mask = inlier_mask
+                best_res_sum = res_sum
+
+    if best_inlier_mask is None or best_inlier_count < 2:
+        best_inlier_mask = np.ones(n_valid, dtype=bool)
+
+    X_inliers = layer_indices[best_inlier_mask].astype(np.float64)
+    y_inliers = radii[best_inlier_mask]
+
+    # Closed-form linear least-squares refinement: r(k) = alpha * k + beta
+    if len(X_inliers) >= 2 and (np.max(X_inliers) - np.min(X_inliers)) > 1e-6:
+        alpha, beta = np.polyfit(X_inliers, y_inliers, deg=1)
     else:
-        slope, intercept = 0.0, float(y_pts[0]) if n_pts > 0 else 0.01
-        inlier_mask = np.arange(n_pts)
+        alpha = 0.0
+        beta = float(np.mean(y_inliers))
 
-    layers_grid = np.arange(num_layers, dtype=np.float64)
-    line_y = slope * layers_grid + intercept
-    min_physical_r = max(1e-4, float(np.min(y_pts)) * 0.05) if n_pts > 0 else 1e-4
-    r2 = max(float(line_y[0]), min_physical_r)  # bottom (min Z)
-    r1 = max(float(line_y[-1]), min_physical_r)  # top (max Z)
+    min_physical_r = max(1e-4, r_min_val * 0.05) if r_min_val > 0 else 1e-4
+    # r2 = bottom (k = 0, z_min), r1 = top (k = num_layers - 1, z_max)
+    r2 = max(float(beta), min_physical_r)
+    r1 = max(float(alpha * (num_layers - 1) + beta), min_physical_r)
 
-    center_arr = np.array(list(layer_center.values()), dtype=np.float64)
-    if not len(inlier_mask):
-        inlier_mask = np.arange(len(center_arr))
-    center = np.array(
-        [
-            np.mean(center_arr[inlier_mask, 0]),
-            np.mean(center_arr[inlier_mask, 1]),
-            (z_min + z_max) / 2,
-        ]
-    )
+    # Lateral center: arithmetic mean of inlier layer centers
+    center_arr = np.array([layer_center[k] for k in layer_indices[best_inlier_mask]], dtype=np.float64)
+    center_xy = np.mean(center_arr, axis=0)
+    center = np.array([
+        center_xy[0],
+        center_xy[1],
+        (z_min + z_max) / 2.0,
+    ])
 
     return r1, r2, height, center
-
-
-def fit_frustum_cone_by_slice_poly(points, num_layers=10):
-    """Estimate cone radii using polynomial RANSAC regression on layer radii.
-
-    Similar to :func:`fit_frustum_cone_by_slice_linear` but uses degree-2
-    polynomial regression for better fit on tapered shapes.
-
-    Args:
-        points: (N, 3) point array.
-        num_layers: Number of horizontal slices.
-
-    Returns:
-        Tuple of (r1, r2, height, center).
-    """
-    points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 4:
-        raise ValueError("Frustum fitting requires at least four XYZ points")
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    z_min = float(np.quantile(z, 0.005))
-    z_max = float(np.quantile(z, 0.995))
-    height = z_max - z_min
-    if height <= np.finfo(np.float64).eps:
-        raise ValueError("Frustum fitting received a degenerate axial extent")
-
-    layer_pts = []
-    for i in range(num_layers):
-        layer_min = z_min + i * height / num_layers
-        layer_max = z_min + (i + 1) * height / num_layers
-        mask = (z >= layer_min) & ((z < layer_max) if i + 1 < num_layers else (z <= layer_max))
-        layer_pts.append(points[mask])
-
-    layer_radius = {}
-    layer_center = {}
-    for layer_idx in range(num_layers):
-        layer_idx_pts = layer_pts[layer_idx]
-        if len(layer_idx_pts) < 4:
-            continue
-        circle_res = fit_circle_kasa(layer_idx_pts[:, :2])
-        if circle_res is not None:
-            c, r = circle_res
-            if r > 0.001:
-                layer_radius[layer_idx] = r
-                layer_center[layer_idx] = c
-
-    if len(layer_radius) < max(3, int(np.ceil(0.3 * num_layers))):
-        return fit_frustum_cone_by_slice_linear(points, num_layers)
-
-    X_fit = np.array(list(layer_radius.keys()))[:, np.newaxis]
-    y_fit = np.array(list(layer_radius.values()))
-    model = make_pipeline(
-        PolynomialFeatures(degree=2),
-        RANSACRegressor(LinearRegression(), random_state=0),
-    )
-    try:
-        model.fit(X_fit, y_fit.ravel())
-    except ValueError:
-        return fit_frustum_cone_by_slice_linear(points, num_layers)
-    ransac_model = model.named_steps["ransacregressor"]
-    inlier_mask = ransac_model.inlier_mask_
-
-    line_x = np.array(range(num_layers))[:, np.newaxis]
-    line_y = model.predict(line_x)
-    min_physical_r = max(1e-4, float(np.min(y_fit)) * 0.05) if len(y_fit) > 0 else 1e-4
-    r2 = max(float(line_y[0]), min_physical_r)
-    r1 = max(float(line_y[-1]), min_physical_r)
-
-    center_arr = np.array(list(layer_center.values()))
-    center = np.array(
-        [
-            np.mean(center_arr[inlier_mask, 0]),
-            np.mean(center_arr[inlier_mask, 1]),
-            (z_min + z_max) / 2,
-        ]
-    )
-    return r1, r2, height, center
-
-
 
 
 # =============================================================================
@@ -592,24 +429,15 @@ def fit_cuboid_obb(pcd):
 
 def fit_frustum_cone_normal(
     pcd,
-    use_poly=False,
     plane_t=0.001,
     normal_t=0.02,
     use_plane_normal=True,
     is_debug=False,
 ):
-    """Fit a truncated cone using surface normal clustering to find the axis.
-
-    When ``use_plane_normal=True``, performs K-means clustering on normals,
-    then picks the cluster whose points best fit a plane (highest inlier ratio).
-    The plane normal becomes the cone axis.
-
-    When ``use_plane_normal=False``, uses RANSAC with ConeAxisLeastSquaresModel
-    to find the axis that minimizes angle variance among normals.
+    """Fit a truncated cone using surface normal clustering or RANSAC to find the axis.
 
     Args:
         pcd: Open3D point cloud (must have normals estimated).
-        use_poly: Use polynomial regression for radius estimation.
         plane_t: Plane segmentation distance threshold.
         normal_t: Normal RANSAC threshold.
         use_plane_normal: Whether to use plane-based or RANSAC-based axis.
@@ -622,8 +450,6 @@ def fit_frustum_cone_normal(
     pcd_normalized = o3d.geometry.PointCloud(pcd)
     pts, m, centroid = pc_normalize(np.asarray(pcd.points))
     pcd_normalized.points = o3d.utility.Vector3dVector(pts)
-    if not pcd_normalized.has_normals():
-        pcd_normalized.estimate_normals()
     points = np.asarray(pcd_normalized.points)
     normals = np.asarray(pcd_normalized.normals) if pcd_normalized.has_normals() else np.empty((0, 3))
     cov = np.cov(points, rowvar=False)
@@ -632,14 +458,23 @@ def fit_frustum_cone_normal(
 
     if use_plane_normal:
         try:
-            plane_model, inliers = pcd_normalized.segment_plane(
-                distance_threshold=plane_t, ransac_n=3, num_iterations=200
+            orig_pts = np.asarray(pcd.points)
+            if not pcd.has_normals():
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
+            orig_normals = np.asarray(pcd.normals)
+            plane_m, inliers = segment_plane_with_normals(
+                orig_pts, orig_normals, dist_threshold=plane_t, angle_threshold_deg=15.0
             )
-            if len(inliers) >= 10:
-                n_plane = np.asarray(plane_model[:3], dtype=np.float64)
-                norm_n = np.linalg.norm(n_plane)
-                if norm_n > 1e-6:
-                    axis_candidates.insert(0, n_plane / norm_n)
+            if plane_m is not None and len(inliers) >= 10:
+                p_in = orig_pts[inliers]
+                c = np.mean(p_in, axis=0)
+                _, _, vh = np.linalg.svd(p_in - c)
+                plane_normal = vh[2, :]
+                plane_normal /= np.linalg.norm(plane_normal)
+                mean_n = np.mean(orig_normals[inliers], axis=0)
+                if np.dot(plane_normal, mean_n) < 0:
+                    plane_normal = -plane_normal
+                axis_candidates.insert(0, plane_normal)
         except Exception:
             pass
     elif len(normals) >= 10:
@@ -661,21 +496,12 @@ def fit_frustum_cone_normal(
         except Exception:
             pass
 
-    def _align_mat_to_z(axis):
-        v = axis / np.linalg.norm(axis)
-        vx = np.cross(v, [0.0, 0.0, 1.0])
-        if np.linalg.norm(vx) < 1e-4:
-            vx = np.cross(v, [0.0, 1.0, 0.0])
-        vx /= np.linalg.norm(vx)
-        vy = np.cross(v, vx)
-        return np.column_stack((vx, vy, v))
-
-    best_score = -1.0
+    best_score = -float("inf")
     best_cone_normal = axis_candidates[0]
-    best_R = _align_mat_to_z(best_cone_normal)
+    best_R = align_vector_to_z(best_cone_normal)
 
     for cand in axis_candidates:
-        R_cand = _align_mat_to_z(cand)
+        R_cand = align_vector_to_z(cand)
         pts_cand = points @ R_cand
         z = pts_cand[:, 2]
         z_min = float(np.quantile(z, 0.005))
@@ -684,29 +510,34 @@ def fit_frustum_cone_normal(
         if h <= 1e-4:
             continue
         valid_slices = 0
+        total_circle_err = 0.0
         for i in range(12):
             mask = (z >= z_min + i * h / 12) & (z <= z_min + (i + 1) * h / 12)
-            if np.count_nonzero(mask) >= 5:
+            layer_pts = pts_cand[mask]
+            if len(layer_pts) >= 5:
                 valid_slices += 1
-        if valid_slices > best_score:
-            best_score = valid_slices
+                c_res = fit_circle_kasa(layer_pts[:, :2])
+                if c_res is not None:
+                    (cx, cy), cr = c_res
+                    dists = np.abs(np.linalg.norm(layer_pts[:, :2] - [cx, cy], axis=1) - cr)
+                    total_circle_err += float(np.mean(dists))
+        score = valid_slices * 10.0 - (total_circle_err / max(1, valid_slices))
+        if score > best_score:
+            best_score = score
             best_cone_normal = cand
             best_R = R_cand
 
     pcd_normalized.rotate(best_R.T, center=[0, 0, 0])
     pts_rotated = np.asarray(pcd_normalized.points)
 
-    if use_poly:
-        r1, r2, height, center = fit_frustum_cone_by_slice_poly(pts_rotated, 12)
-    else:
-        r1, r2, height, center = fit_frustum_cone_by_slice_linear(pts_rotated, 12, pcd)
+    r1, r2, height, center = fit_frustum_cone_by_slice_linear(pts_rotated, 12, pcd)
 
     world_center = centroid + m * (best_R @ np.asarray(center))
     T = _safe_se3(best_R, world_center)
     return r1 * m, r2 * m, height * m, T
 
 
-def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0, num_layers=12):
+def fit_frustum_cone_pca(pcd, is_debug=False, z_dir=0, num_layers=12):
     """Fit a truncated cone using PCA to find the symmetry axis."""
     pcd_normalized = o3d.geometry.PointCloud(pcd)
     pts, m, centroid = pc_normalize(np.asarray(pcd.points))
@@ -716,22 +547,12 @@ def fit_frustum_cone_pca(pcd, use_poly=False, is_debug=False, z_dir=0, num_layer
     pca = PCA(n_components=3)
     pca.fit(points)
     cone_normal = pca.components_[z_dir]
-
-    v = cone_normal / np.linalg.norm(cone_normal)
-    vx = np.cross(v, [0.0, 0.0, 1.0])
-    if np.linalg.norm(vx) < 1e-4:
-        vx = np.cross(v, [0.0, 1.0, 0.0])
-    vx /= np.linalg.norm(vx)
-    vy = np.cross(v, vx)
-    R_mat = np.column_stack((vx, vy, v))
+    R_mat = align_vector_to_z(cone_normal)
 
     pcd_normalized.rotate(R_mat.T, center=[0, 0, 0])
     pts_rotated = np.asarray(pcd_normalized.points)
 
-    if use_poly:
-        r1, r2, height, center = fit_frustum_cone_by_slice_poly(pts_rotated, num_layers)
-    else:
-        r1, r2, height, center = fit_frustum_cone_by_slice_linear(pts_rotated, num_layers, pcd)
+    r1, r2, height, center = fit_frustum_cone_by_slice_linear(pts_rotated, num_layers, pcd)
 
     world_center = centroid + m * (R_mat @ np.asarray(center))
     T = _safe_se3(R_mat, world_center)
@@ -742,7 +563,7 @@ def fit_frustum_cone_obb(pcd):
     """Fit a truncated cone using the Oriented Bounding Box method.
 
     Uses OBB to establish the initial frame, determines the symmetry axis,
-    then fits circles on top/bottom slices.
+    then computes cross-sectional radii on top/bottom slices.
 
     Args:
         pcd: Open3D point cloud.
@@ -756,16 +577,14 @@ def fit_frustum_cone_obb(pcd):
     obb = _oriented_bounding_box(pcd_fit)
     T_obb = _safe_se3(obb.R, obb.center)
     pcd_fit.transform(T_obb.inv())
+    pts_local = np.asarray(pcd_fit.points)
 
-    half_dim = [max(pts[:, 0]), max(pts[:, 1]), max(pts[:, 2])]
+    half_dim = [float(np.max(np.abs(pts_local[:, i]))) for i in range(3)]
     plane_axis = get_plane_axis(pcd_fit, half_dim)
     if plane_axis == -1:
-        print("Error: could not determine plane axis direction")
-        return SE3(), 0, 0
-    height = half_dim[plane_axis] * 2
-    _, top_r, bottom_r = _get_adjust_transform(
-        pts, pts.shape[0], half_dim, plane_axis, pcd_fit
-    )
+        return 0.0, 0.0, 0.0, SE3()
+    height = half_dim[plane_axis] * 2.0
+    top_r, bottom_r = _get_obb_radii(pts_local, half_dim, plane_axis)
     return top_r, bottom_r, height, T_obb
 
 
@@ -788,10 +607,10 @@ def compute_cone_residual(
         T_mat = T.A if hasattr(T, "A") else np.asarray(T, dtype=np.float64)
         fit_pcd.transform(T_mat)
 
-        n_pts = len(pcd.points)
+        n_pts = len(pcd.points) if hasattr(pcd, "points") else len(pcd)
         if n_pts > 2000:
             step = max(1, n_pts // 2000)
-            eval_pcd = pcd.uniform_down_sample(every_k_points=step)
+            eval_pcd = pcd.uniform_down_sample(every_k_points=step) if hasattr(pcd, "uniform_down_sample") else pcd[::step]
         else:
             eval_pcd = pcd
 
@@ -803,17 +622,17 @@ def compute_cone_residual(
 def fit_frustum_cone_adaptive(
     pcd,
     tau_cone: float = 2.0,
-    use_poly=False,
     is_debug=False,
 ):
     """Fit a truncated cone using sequential multi-hypothesis threshold early-exit.
 
-    Hypothesis hierarchy according to Chapter 4 (Algorithm 4.1) and Chapter 5:
-    1. Surface Normal Clustering / Plane Segmentation ("normal"): Plane-normal aligned axis when end-caps are visible.
-    2. Surface Normal RANSAC ("normal_ransac"): Orthogonality / variance-minimizing axis from lateral surface normals.
-    3. PCA Principal Axis ("pca_z0"): Dominant elongated axis for bottles, cups, tubes.
-    4. PCA Secondary Axis ("pca_z2"): Flatter axis for bowls, shallow containers.
-    5. Oriented Bounding Box ("obb"): Global 3D bounding frame for truncated views.
+    Hypothesis hierarchy sorted in ascending order of computational runtime (shortest first)
+    according to Chapter 4 (Algorithm 4.1):
+    1. PCA Principal Axis ("pca_z0"): Closed-form eigen-decomposition (~0.1 ms).
+    2. PCA Secondary Axis ("pca_z2"): Closed-form secondary eigen-decomposition (~0.1 ms).
+    3. Oriented Bounding Box ("obb"): Fast bounding extent projection (~0.8 ms).
+    4. Surface Normal Clustering / Plane Segmentation ("normal"): RANSAC plane segmentation (~5 ms).
+    5. Surface Normal RANSAC ("normal_ransac"): Non-linear angle variance optimization RANSAC (~30 ms).
 
     Exits early as soon as a hypothesis achieves robust trimmed distance <= tau_cone (default 2.0 mm).
     If no hypothesis meets the threshold, returns the hypothesis with the minimal residual.
@@ -830,16 +649,26 @@ def fit_frustum_cone_adaptive(
         pcd_fit = pcd
 
     hypotheses = [
-        ("pca_z0", lambda: fit_frustum_cone_pca(pcd_fit, use_poly=use_poly, z_dir=0)),
-        ("pca_z2", lambda: fit_frustum_cone_pca(pcd_fit, use_poly=use_poly, z_dir=2)),
-        ("normal", lambda: fit_frustum_cone_normal(pcd_fit, use_poly=use_poly, plane_t=0.005, normal_t=0.02, use_plane_normal=True)),
-        ("normal_ransac", lambda: fit_frustum_cone_normal(pcd_fit, use_poly=use_poly, plane_t=0.01, normal_t=0.02, use_plane_normal=False)),
+        ("pca_z0", lambda: fit_frustum_cone_pca(pcd_fit, z_dir=0)),
+        ("pca_z2", lambda: fit_frustum_cone_pca(pcd_fit, z_dir=2)),
         ("obb", lambda: fit_frustum_cone_obb(pcd_fit)),
+        ("normal", lambda: fit_frustum_cone_normal(pcd_fit, plane_t=0.005, normal_t=0.02, use_plane_normal=True)),
+        ("normal_ransac", lambda: fit_frustum_cone_normal(pcd_fit, plane_t=0.01, normal_t=0.02, use_plane_normal=False)),
     ]
 
     best_fit = None
     best_residual = float("inf")
     best_method = "none"
+
+    # Scale-adaptive early exit threshold check:
+    # If pointcloud scale is in meters (bbox diagonal < 5.0), convert tau_cone (mm) to meters.
+    # If pointcloud scale is in millimeters (bbox diagonal >= 5.0), tau_thresh is directly tau_cone (mm).
+    pts_arr = np.asarray(pcd_fit.points) if hasattr(pcd_fit, "points") else np.asarray(pcd_fit)
+    diag = float(np.linalg.norm(np.ptp(pts_arr, axis=0))) if len(pts_arr) > 0 else 1.0
+    if diag < 5.0:
+        tau_thresh = tau_cone * 1e-3 if tau_cone > 0.05 else tau_cone
+    else:
+        tau_thresh = tau_cone
 
     for name, solver in hypotheses:
         try:
@@ -856,8 +685,8 @@ def fit_frustum_cone_adaptive(
             best_fit = (r1, r2, h, T)
             best_method = name
 
-        # Threshold Early-Exit condition (门限早停: <= tau_cone mm)
-        if residual <= tau_cone:
+        # Threshold Early-Exit condition (门限早停: <= tau_thresh)
+        if residual <= tau_thresh:
             return best_fit[0], best_fit[1], best_fit[2], best_fit[3], best_method, best_residual
 
     if best_fit is not None:
@@ -865,11 +694,13 @@ def fit_frustum_cone_adaptive(
 
     # Fallback to normal if all failed
     try:
-        r1, r2, h, T = fit_frustum_cone_normal(pcd, use_poly=use_poly)
-        return r1, r2, h, T, "normal_fallback", float("inf")
+        r1, r2, h, T = fit_frustum_cone_normal(pcd)
+        res = compute_cone_residual(pcd, r1, r2, h, T)
+        return r1, r2, h, T, "normal_fallback", res
     except Exception:
-        r1, r2, h, T = fit_frustum_cone_pca(pcd, z_dir=0)
-        return r1, r2, h, T, "pca_z0_fallback", float("inf")
+        pass
+
+    return 0.0, 0.0, 0.0, SE3(), "failed", float("inf")
 
 
 def _rotvec_to_mat(v):
@@ -938,79 +769,69 @@ def _fit_ellipsoid_geometric(points):
         coef = np.zeros(3)
 
     if np.all(coef > 1e-8):
-        nnls_axes = 1.0 / np.sqrt(coef)
-        nnls_aspect = float(np.max(nnls_axes) / np.min(nnls_axes))
-        if nnls_aspect <= 3.5 and np.max(nnls_axes) <= 1.5 * diagonal and np.min(nnls_axes) >= diagonal * 0.02:
-            world_c = centroid + pca_vecs @ local_c
-            return (float(nnls_axes[0]), float(nnls_axes[1]), float(nnls_axes[2]), SE3.Rt(SO3(pca_vecs), world_c))
+        semi_axes = 1.0 / np.sqrt(coef)
+        world_center = centroid + pca_vecs @ local_c
+        max_dim = diagonal * 1.5
+        min_dim = max(diagonal * 0.02, 1e-3)
+        if np.all(semi_axes <= max_dim) and np.all(semi_axes >= min_dim):
+            T = _safe_se3(pca_vecs, world_center)
+            return (float(semi_axes[0]), float(semi_axes[1]), float(semi_axes[2]), T)
 
-    # Level 2: Fast bounded Levenberg-Marquardt / TRF on <= 150 points (~30-50 ms)
-    if len(pts_opt) > 150:
-        pts_trf = pts_opt[::2]
-    else:
-        pts_trf = pts_opt
+    # Level 2: Robust bounded optimization using Taubin metric + soft_l1 (~20-40 ms)
+    init_axes = np.sqrt(np.maximum(pca_vals, 1e-6)) * 2.0
+    init_axes = np.clip(init_axes, diagonal * 0.05, diagonal * 0.8)
+    initial_params = np.concatenate([centroid, np.log(init_axes), np.zeros(3)])
 
-    extent = np.ptp(pts_pca, axis=0)
-    initial_axes = np.maximum(extent / 2.0, diagonal * 0.05)
-
-    rotvec = Rotation.from_matrix(pca_vecs).as_rotvec()
-    pushed_center = centroid + pca_vecs @ local_c
-    starts = [
-        np.concatenate((centroid, np.log(initial_axes), rotvec)),
-        np.concatenate((pushed_center, np.log(initial_axes), rotvec)),
-    ]
-
-    start_errors = [
-        float(np.median(np.abs(_ellipsoid_geometric_residual(s, pts_trf)[:-1])))
-        for s in starts
-    ]
-    best_initial = starts[int(np.argmin(start_errors))]
-
-    lower = np.concatenate((pts.min(axis=0) - 0.5 * diagonal, np.full(3, np.log(diagonal * 0.02)), np.full(3, -np.pi)))
-    upper = np.concatenate((pts.max(axis=0) + 0.5 * diagonal, np.full(3, np.log(diagonal * 1.5)), np.full(3, np.pi)))
-    scale = max(diagonal * 0.02, 1e-4)
+    lb = np.concatenate([centroid - diagonal * 0.5, np.log(np.full(3, diagonal * 0.02)), -np.full(3, np.pi)])
+    ub = np.concatenate([centroid + diagonal * 0.5, np.log(np.full(3, diagonal * 1.5)), np.full(3, np.pi)])
 
     try:
-        result = least_squares(
+        res = least_squares(
             _ellipsoid_geometric_residual,
-            best_initial,
-            args=(pts_trf,),
-            bounds=(lower, upper),
+            initial_params,
+            bounds=(lb, ub),
+            args=(pts_opt,),
             loss="soft_l1",
-            f_scale=scale,
-            max_nfev=40,
-            ftol=1e-2,
-            xtol=1e-2,
+            f_scale=max(diagonal * 0.02, 1e-3),
+            max_nfev=35,
         )
+        if not res.success and res.status <= 0:
+            return None
+        c_opt = res.x[:3]
+        axes_opt = np.exp(res.x[3:6])
+        R_opt = _rotvec_to_mat(res.x[6:])
+        T = _safe_se3(R_opt, c_opt)
+        return (float(axes_opt[0]), float(axes_opt[1]), float(axes_opt[2]), T)
     except Exception:
         return None
 
-    parameters = result.x
-    axes = np.exp(parameters[3:6])
-    rotation = _rotvec_to_mat(parameters[6:])
-    if not np.all(np.isfinite(axes)) or np.any(axes <= 0.0):
-        return None
-
-    return (float(axes[0]), float(axes[1]), float(axes[2]), _safe_se3(rotation, parameters[:3]))
-
 
 def fit_ellipsoid(pcd, num_it=100, t=0.015, return_details=False):
-    """Fit an ellipsoid using RANSAC + algebraic least-squares with fast geometric fallback.
+    """Fit an ellipsoid to a 3D point cloud using RANSAC + algebraic least squares.
+
+    Falls back to fast, robust geometric fitting if RANSAC fails or yields non-ellipsoidal quadrics.
 
     Args:
         pcd: Open3D point cloud.
         num_it: RANSAC iterations.
-        t: RANSAC inlier threshold (in normalized coordinates).
+        t: Distance threshold for inlier counting.
         return_details: If True, returns (a, b, c, T, is_fallback).
 
     Returns:
-        Tuple of (a, b, c, T) or (a, b, c, T, is_fallback). Returns None if fitting fails.
+        Tuple of (a, b, c, T) or None.
     """
     raw_points = np.asarray(pcd.points, dtype=np.float64)
+    num_points = len(raw_points)
+    if num_points < 9:
+        geom_result = _fit_ellipsoid_geometric(raw_points)
+        if geom_result is None:
+            return None
+        return (*geom_result, True) if return_details else geom_result
+
     diagonal = float(np.linalg.norm(np.ptp(raw_points, axis=0)))
     points, m, centroid = pc_normalize(raw_points)
-    num_points = len(points)
     ellipsoid_model = EllipsoidLeastSquaresModel()
+
     best_fit, best_inlier_idxs = ransac(
         points,
         ellipsoid_model,
@@ -1045,7 +866,7 @@ def fit_ellipsoid(pcd, num_it=100, t=0.015, return_details=False):
 
 
 class FittingByBGS:
-    """Dispatcher that selects and runs the appropriate fitting algorithm.
+    """Dispatcher that selects and runs the appropriate primitive fitting algorithm.
 
     Shape class codes:
       - ``'0'``:  Cuboid via RANSAC plane segmentation + OBB (with automatic OBB fallback)
@@ -1059,13 +880,14 @@ class FittingByBGS:
         self.last_fallback_triggered = False
         self.last_fallback_type = None
 
-    def fitting(self, pcd, cls="0", visual=False):
+    def fitting(self, pcd, cls="0", visual=False, tau_cone=2.0):
         """Fit a primitive shape to the point cloud.
 
         Args:
             pcd: Open3D point cloud (with normals for cone methods).
             cls: Shape class code string ("0", "1", "2").
             visual: Show debug visualization.
+            tau_cone: Residual threshold (mm) for cone adaptive early-exit.
 
         Returns:
             List of parameters ``[dim1, dim2, dim3, T]`` or empty list on failure.
@@ -1075,11 +897,11 @@ class FittingByBGS:
         self.last_fallback_triggered = False
         self.last_fallback_type = None
 
-        # Fast uniform downsample if needed
-        n_pts = len(pcd.points)
+        # Downsample if needed
+        n_pts = len(pcd.points) if hasattr(pcd, "points") else len(pcd)
         if n_pts > 5000:
             step = max(1, n_pts // 5000)
-            pcd_fit = pcd.uniform_down_sample(every_k_points=step)
+            pcd_fit = pcd.uniform_down_sample(every_k_points=step) if hasattr(pcd, "uniform_down_sample") else pcd[::step]
         else:
             pcd_fit = pcd
 
@@ -1101,7 +923,7 @@ class FittingByBGS:
         elif cls == "1":
             try:
                 r1, r2, height, T, method, res = fit_frustum_cone_adaptive(
-                    pcd_fit, tau_cone=2.0
+                    pcd_fit, tau_cone=tau_cone
                 )
                 self.last_method = f"cone_adaptive_{method}"
             except Exception as exc:
@@ -1131,6 +953,10 @@ class FittingByBGS:
             if visual:
                 self._visualize_ellipsoid(pcd, a, b, c, T)
             params = [a, b, c, T]
+
+        else:
+            self.last_error = f"unsupported_shape_class_{cls}"
+            return []
 
         return params
 
